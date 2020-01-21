@@ -1,0 +1,20 @@
+Required non script files/ folders in the same directory as this script include:
+    * Master_info_correct_cm.csv    -- Containing the filenames, programme IDs, observing blocks, resolutions,
+                                       shortnames, distances, spectral type and spectral type number.
+    * observing_qc_positions_parseable.txt  -- Containing the programme IDs, observing bocks, resolutions
+                                               and x pixel where the spectra is on the image (default is 250).
+    * calib_models/     -- Containing the WD models that correspond with the observed standards
+    * alt_done.log      -- An empty text file to be filled with the files that have been reduced already
+    * good_wds.txt      -- A descriptive file of which standards per observing block should be used
+    * BPM_(resolution)_python.txt       -- A file for the bad pixel masks for the resolution (else one will be made)
+    * alt_doplot.log    -- A descriptive file for which spectra should be plotted per observing block
+    * (resolution)_arcmap.txt       -- A file of pixel and wavelength
+    * R300R_correction_function.txt     -- Correcting second order contamination in R300R spectra
+    * alt_redspec/	-- Where the produced data is stored
+    * alt_redspec/bias      -- Where the produced bias frames are stored
+    * alt_redspec/flat      -- Where the produced flat frames are stored
+    * alt_redspec/standards      -- Where the produced standards will be
+    * alt_redspec/objects      -- Where the reduced data will be stored
+
+Standard Python Libraries (designed for Python 3.6+) plus (any Python 3 compatible version of):
+numpy, matplotlib, astropy, scipy. 
