@@ -37,10 +37,13 @@ main()
 import numpy as np
 import glob
 from astropy.table import Table
+from splat import Spectrum
+from splat.plot import plotSpectrum
+import astropy.units as u
 from matplotlib.backends.backend_pdf import PdfPages
-from matplotlib import rc
+from matplotlib import rc, rcParams
 import matplotlib.pyplot as plt
-import multiprocessing
+# import multiprocessing
 import sys
 from typing import Tuple
 
@@ -117,8 +120,8 @@ def split_spec_sequence(n: int, pp: PdfPages, res: str, tsubset: Table, tcheck: 
     ax = plt.subplot(111)
     for row in tsubset:  # over all rows in new table
         wave, flux = np.loadtxt(row['Path'], unpack=True, usecols=(0, 1))  # read file
-        #  doplot = residual_check(tcheck, f'{row["OB"]}_{res}_{row["Program"]}')
-        doplot = True
+        doplot = residual_check(tcheck, f'{row["OB"]}_{res}_{row["Program"]}')
+        # doplot = True
         if doplot:
             wave = wave[flux > 0]  # cut to positive flux
             flux = flux[flux > 0]  # cut to positive flux
@@ -238,7 +241,7 @@ def objects(res: str):
     plot_list = glob.glob(f'alt_redspec/objects/*{res}*txt')
     plot_list.sort()
     for i in plot_list:
-        plt.figure(c, figsize=(20, 10))
+        plt.figure(c, figsize=(8, 6))
         wave, flux, error = np.loadtxt(i, unpack=True)
         wave = wave[flux > 0]
         error = error[flux > 0]
@@ -252,7 +255,7 @@ def objects(res: str):
         rc('text', usetex=True)
         plt.xlabel(r'Wavelength $\AA$')
         plt.ylabel(r'Log $\lambda F_{\lambda}$ $erg/cm^{2}/s/\AA$')
-        plt.legend(fontsize='x-large')
+        plt.legend()
         plt.yscale('log')
         pp.savefig()
         plt.close()
@@ -332,41 +335,44 @@ def calib_functions(res: str):
 
 def limited_sequence():
     """Plots one object per spectral type into a sequence using splat"""
-    import splat
-    import astropy.units as u
     chosen_dict = {'M9': 'OB0005_R2500I_GTC8-15ITP_J0502+1442.txt',
-                   'M9.5': 'OB0008_R2500I_GTC54-15A0_J1221+0257.txt',
-                   'M9.5 beta': 'OB0005_R2500I_GTC54-15A0_J0953-1014.txt',
+                   # 'M9.5': 'OB0008_R2500I_GTC54-15A0_J1221+0257.txt',
+                   # 'M9.5 beta': 'OB0005_R2500I_GTC54-15A0_J0953-1014.txt',
                    'L0': 'OB0019_R2500I_GTC8-15ITP_J1412+1633.txt',
-                   'L0.5': 'OB0001_R2500I_GTC8-15ITP_J0028-1927.txt',
+                   # 'L0.5': 'OB0001_R2500I_GTC8-15ITP_J0028-1927.txt',
                    'L1': 'OB0015_R2500I_GTC8-15ITP_J1127+4705.txt',
                    'L2': 'OB0002_R2500I_GTC8-15ITP_J0235-0849.txt',
-                   'L2.5': 'OB0018_R2500I_GTC8-15ITP_J1346+0842.txt',
+                   # 'L2.5': 'OB0018_R2500I_GTC8-15ITP_J1346+0842.txt',
                    'L3': 'OB0008_R2500I_GTC8-15ITP_J0823+6125.txt',
-                   'L3 gamma': 'OB0024_R2500I_GTC54-15A0_J1004+5022.txt',
-                   'L3.5': 'OB0031_R2500I_GTC8-15ITP_J2339+3507.txt',
-                   'L4 w/ Li': 'OB0034_R2500I_GTC54-15A0_J1246+4027.txt',
-                   'L4.5': 'OB0023_R2500I_GTC8-15ITP_J1539-0520.txt',
+                   # 'L3 gamma': 'OB0024_R2500I_GTC54-15A0_J1004+5022.txt',
+                   # 'L3.5': 'OB0031_R2500I_GTC8-15ITP_J2339+3507.txt',
+                   'L4': 'OB0034_R2500I_GTC54-15A0_J1246+4027.txt',
+                   # 'L4.5': 'OB0023_R2500I_GTC8-15ITP_J1539-0520.txt',
                    'L5': 'OB0030_R2500I_GTC54-15A0_J1213-0432.txt',
-                   'L5.5': 'OB0021_R2500I_GTC54-15A0_J1750-0016.txt',
+                   # 'L5.5': 'OB0021_R2500I_GTC54-15A0_J1750-0016.txt',
                    'L6': 'OB0027_R2500I_GTC8-15ITP_J1717+6526.txt'}
-    splist, labels, c, zpoints = [], [], 0, []
+    # chosen_dict = {key: chosen_dict[key] for key in [*chosen_dict.keys(), ][::-1]}  # invert dictionary order
+    splist, labels, c, zpoints = [], [], 1, []
     for k in chosen_dict:
         f = chosen_dict[k]
         sname = f.split('_')[-1].strip('.txt')
         f = 'alt_redspec/objects/' + f
         spt = k
-        sp = splat.Spectrum(filename=f, wunit=u.Angstrom, funit=(u.erg / u.cm ** 2 / u.Angstrom / u.s))
+        sp = Spectrum(filename=f, wunit=u.Angstrom, funit=(u.erg / u.cm ** 2 / u.Angstrom / u.s))
         sp.normalize(waverange=[8100, 8200])
-        sp.wave = sp.wave[sp.flux.value < 3]
-        sp.flux = sp.flux[sp.flux.value < 3]
+        idx = np.logical_and(sp.flux.value < 3, sp.flux.value > 0)
+        sp.wave = sp.wave[idx]
+        sp.flux = sp.flux[idx] * c
         zpoints.append(c)
-        c -= 3
+        c /= 100
         splist.append(sp)
         labels.append(f'{sname}: {spt}')
-    splat.plotSpectrum(splist, labels=labels, figsize=[20, 50], zeropoint=zpoints, colorScheme='copper',
-                       legendLocation='outside', features=['H2O', 'TiO', 'FeH', 'K1', 'Na1', 'Ca2', 'H1'],
-                       yrange=[c, 6], output='concise_spec_sequence.pdf')
+    plotSpectrum(splist, labels=labels, figsize=[8, 12], colorScheme='copper',
+                 legendLocation='outside', features=['H2O', 'TiO', 'FeH'],
+                 # zeropoint=np.logspace(0, -(len(chosen_dict) - 1), len(chosen_dict)),
+                 xlabel=r'Wavelength [$\AA$]',
+                 ylabel=r'Normalised $\mathrm{F_{\lambda}}$ [$\mathrm{erg}\ \AA^{-1}\ \mathrm{cm^{-2}}\ s^{-1}$]',
+                 linestyle='solid', yrange=[c, 10], ylog=True, output='concise_spec_sequence.pdf')
     print('Plotted the concise spectral sequence')
     return
 
@@ -377,32 +383,35 @@ def main():
     This is the main method of the script, in which it controls all the different different plots, designed to be
     multi-threaded over the available cores.
     """
-    processes = []
+    # processes = []
     tnew300, tnew2500 = tabulate()
-    for i in ((tnew300, 'R0300R'), (tnew2500, 'R2500I')):
-        p = multiprocessing.Process(target=spec_sequence, args=i)
-        processes.append(p)
-        p.start()
-    for i in ('R0300R', 'R2500I'):
-        p = multiprocessing.Process(target=standards, args=(i, ))
-        processes.append(p)
-        p.start()
-        p2 = multiprocessing.Process(target=objects, args=(i, ))
-        processes.append(p2)
-        p2.start()
-        p3 = multiprocessing.Process(target=calib_functions, args=(i, ))
-        processes.append(p3)
-        p3.start()
-    for i in (('R0300R', 'objects'), ('R0300R', 'standards'), ('R2500I', 'objects'), ('R2500I', 'standards')):
-        p = multiprocessing.Process(target=residuals, args=i)
-        processes.append(p)
-        p.start()
-    p = multiprocessing.Process(target=limited_sequence)
-    processes.append(p)
-    p.start()
-    for process in processes:
-        process.join()
-    print('Finished processes.')
+    objects('R0300R')
+    objects('R2500I')
+    # for i in ((tnew300, 'R0300R'), (tnew2500, 'R2500I')):
+    #     p = multiprocessing.Process(target=spec_sequence, args=i)
+    #     processes.append(p)
+    #     p.start()
+    # for i in ('R0300R', 'R2500I'):
+    #     p = multiprocessing.Process(target=standards, args=(i, ))
+    #     processes.append(p)
+    #     p.start()
+    #     p2 = multiprocessing.Process(target=objects, args=(i, ))
+    #     processes.append(p2)
+    #     p2.start()
+    #     p3 = multiprocessing.Process(target=calib_functions, args=(i, ))
+    #     processes.append(p3)
+    #     p3.start()
+    # for i in (('R0300R', 'objects'), ('R0300R', 'standards'), ('R2500I', 'objects'), ('R2500I', 'standards')):
+    #     p = multiprocessing.Process(target=residuals, args=i)
+    #     processes.append(p)
+    #     p.start()
+    # p = multiprocessing.Process(target=limited_sequence)
+    # processes.append(p)
+    # p.start()
+    # for process in processes:
+    #     process.join()
+    # print('Finished processes.')
+    # limited_sequence()
     return
 
 
@@ -410,4 +419,14 @@ if __name__ == '__main__':
     if len(sys.argv) == 2 and sys.argv[1] in ('--help', '-h'):  # if called command line 'python alt_plot.py --help
         print(__doc__)  # then print the documentation
     else:
+        rcParams.update({'axes.labelsize': 'small', 'axes.titlesize': 'small',
+                         'xtick.labelsize': 'small', 'ytick.labelsize': 'small',
+                         'legend.fontsize': 'small', 'font.serif': ['Helvetica', 'Arial',
+                                                                    'Tahoma', 'Lucida Grande',
+                                                                    'DejaVu Sans'],
+                         'font.family': 'serif', 'legend.frameon': False, 'legend.facecolor': 'none',
+                         'mathtext.fontset': 'cm', 'mathtext.default': 'regular',
+                         'figure.figsize': [4, 3], 'figure.dpi': 144, 'lines.linewidth': .75,
+                         'xtick.top': True, 'ytick.right': True, 'legend.handletextpad': 0.5,
+                         'xtick.minor.visible': True, 'ytick.minor.visible': True})
         main()

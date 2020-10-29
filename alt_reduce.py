@@ -41,10 +41,13 @@ main
 # TODO: Convert the above described requirements into something more soft coded that a user can provide.
 # TODO: Create example folder if githubbing so people can make their equivalents
 import numpy as np  # general mathematics and array handling
-import glob  # equivalent to linux 'ls'
 from astropy.io import fits  # opening multiple HDU fits files
 from astropy.table import Table  # opening files as data tables
 import scipy.interpolate as sinterp  # for interpolation (we use linear)
+import matplotlib.pyplot as plt
+
+import argparse
+import glob  # equivalent to linux 'ls'
 import warnings  # used for suppressing an annoying warning message about runtime
 import sys  # system arguments
 import multiprocessing  # used to overcome the inherent python GIL
@@ -186,20 +189,53 @@ class OB:
         self.prog = ptodata.split('/')[2]  # program ID
         self.resolution = ptodata.split('/')[1]  # resolution of this spectra
         if self.target_check():
+            self.figobj, self.axesobj = plt.subplots(4, 4, figsize=(16, 12), dpi=300)
+            self.axesobj = self.axesobj.flatten()
+            self.figstd, self.axesstd = plt.subplots(4, 4, figsize=(16, 12), dpi=300)
+            self.axesstd = self.axesstd.flatten()
             self.coordinate = self.get_pixcoord()  # find pixel coordinate
             self.pixlow, self.pixhigh = self.pixel_constraints()
             self.ptobias = ptodata + '/bias/0*fits'  # path to biases
             self.master_bias = self.bias(self.ptobias)  # creates the master bias file
+            self.axesobj[4].imshow(self.master_bias, cmap='plasma', origin='lower', aspect='auto')
             self.ptoflats = ptodata + '/flat/0*fits'  # path to flats
             self.master_flat = self.flat(self.ptoflats, self.master_bias)  # creates the master flat file
+            self.axesobj[5].imshow(self.master_flat, cmap='plasma', origin='lower', aspect='auto')
+            self.bpm = self.bpm_applying(np.ones_like(self.master_flat))
+            self.axesobj[6].imshow(self.bpm, cmap='plasma', origin='lower', aspect='auto')
             self.ptoobj = ptodata + '/object/0*fits'  # path to object
             self.humidity, self.airmass, self.mjd = self.hum_air()  # average humidity and airmass of object obs
             self.ptostds = ptodata + '/stds/0*scopy.fits'  # path to standard
             self.ftoabs, self.master_standard, self.ftoabs_error, self.standard_name, \
-            self.standard_residual = np.array(self.standard())  # reduces the closest standard to target
-            self.master_standard, self.actual_standard = self.object(self.ptostds)[:2]  # reduces block standard
+            self.standard_residual = self.standard()  # reduces the closest standard to target
+            self.actual_standard = self.standard_name
+            # self.master_standard, self.actual_standard = self.object(self.ptostds)[:2]  # reduces block standard
             self.master_target, self.target, self.target_residual = self.object(self.ptoobj)  # reduces target
             self.writing('alt_redspec')  # writes reduced spectra to files
+            for axes in (self.axesobj, self.axesstd):
+                axes[1].set_title('Bias Subtracted')
+                axes[2].set_title('Flat Fielded')
+                axes[3].set_title('Bad Pixel Masked')
+                axes[4].set_title('Bias')
+                axes[5].set_title('Flat')
+                axes[6].set_title('Bad Pixel Mask')
+                axes[7].set_title('Extraction Region')
+                axes[8].set_title('Extracted Spectra')
+                axes[9].set_title('Wavelength Calibrated')
+                axes[12].set_title('Arc Map')
+            self.axesobj[10].set_title('Final')
+            self.axesstd[10].set_title('Wavelength Calibrated')
+            self.axesobj[13].set_title('Calibration Function')
+            self.axesstd[11].set_title('Final')
+            self.axesstd[13].set_title('Model')
+            self.axesstd[14].set_title('Calibration Function')
+            [self.figobj.delaxes(self.axesobj[i]) for i in [11, 14, 15]]
+            [self.figstd.delaxes(self.axesstd[i]) for i in [15, ]]
+            self.figobj.savefig(f'alt_redspec/reduction/{self.ob}_{self.resolution}_{self.prog}_{self.target}.png',
+                                bbox_inches='tight')
+            self.figstd.savefig(f'alt_redspec/reduction/{self.ob}_{self.resolution}_{self.prog}'
+                                f'_{self.standard_name}.png',
+                                bbox_inches='tight')
             print(f'Object processed: {self.target} for {self.resolution} '
                   f'grism in {self.ob} with walltime {round(time.time() - tproc0, 1)} seconds.')
         else:
@@ -407,10 +443,10 @@ class OB:
         bpm_flat = self.bpm_applying(median_flat)  # apply bad pixel mask
         return self.normalise(bpm_flat)  # normalised flat
 
-    def transform(self, pixel: np.ndarray) -> np.ndarray:
+    def transform(self, pixel: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Transform pixels into wavelength
 
-        Loads the given file from OSIRIS, extracts the pixel and wavelength then fits a 4th order polynomial
+        Loads the given file from OSIRIS, extracts the pixel and wavelength then fits a 3rd order polynomial
         and applies that to all the pixels given.
 
         Parameters
@@ -421,7 +457,7 @@ class OB:
         arcpix, arcwav = np.loadtxt(f'{self.resolution}_arcmap.txt', unpack=True, usecols=(0, 2))  # pixels to wave
         co_eff = np.polyfit(arcpix, arcwav, 3)  # the coefficients of the polynomial from pixel to wavelength
         f = np.poly1d(co_eff)  # the fit to those coefficients
-        return f(pixel)  # wavelengths
+        return f(pixel), arcpix, arcwav  # wavelengths
 
     @staticmethod
     def checkifspectra(spectral_list: list) -> np.ndarray:
@@ -472,8 +508,8 @@ class OB:
             The flat fielded CCD which contains infinite values
         """
         temp = data.flatten()  # turns the 2D CCD into 1D
-        for i in range(len(temp)):
-            if temp[i] == np.inf:  # if the value is infinite
+        for i, val in enumerate(temp):
+            if np.isinf(val):  # if the value is infinite
                 temp[i] = 0  # set it to 0 (bad pixel)
         return temp.reshape(data.shape)  # reshape back to 2D, but with bad pixels now 0 not infinite
 
@@ -496,40 +532,21 @@ class OB:
         return backsubbed
 
     @staticmethod
-    def recenter(segment: np.ndarray, ind: np.ndarray) -> int:
+    def recenter(segment: np.ndarray, cpix: int) -> int:
         """Finds the center of the aperture
 
         Parameters
         ----------
         segment : np.ndarray
             A 1D array of the counts
-        ind : np.ndarray
-            A 1D array same size as segment with the indices of the segment
+        cpix : int
+            The current central pixel
         """
-        cpix = ind[len(ind) // 2]  # the central index of the row
+        # cpix = ind[len(ind) // 2]  # the central index of the row
         cpix = np.argmax(segment[cpix - 10:cpix + 10]) + cpix - 10  # the new central row index where the peak is in 10
         return cpix
 
-
-    @staticmethod
-    def mean_back(segment: np.ndarray) -> Tuple[np.ndarray, float, float]:
-        """Finds the mean background of a strip
-
-        Parameters
-        ----------
-        segment : np.ndarray
-            The 50 pixel row around the spectral pixel coordinate
-        """
-        ind = np.arange(len(segment))  # an array of indices in the same length as the row
-        med = np.median(segment)  # the median of the row
-        w = OB.inf_fix(1 / abs(med - segment))  # weights determined by distance from the median
-        # the closer the count to the median, the higher it is weighted, i.e. real signal and cosmic rays are supressed
-        pfit = np.poly1d(np.polyfit(ind, segment, 1, w=w))  # straight line fit weighted by distance from median
-        back = pfit(ind)  # values of the straight line fit
-        backmean = back.mean()  # the mean straight line value is the background
-        return ind, med, backmean
-
-    def peak_average(self, segment: np.ndarray, leftwidth: int, rightwidth: int) -> float:
+    def peak_average(self, segment: np.ndarray, cpix: int) -> Tuple[float, int, int, int]:
         """Takes the strip of the CCD and gets the median around the peak
 
         This method extracts the full signal. It is given a 50 pixel row centered on the pixel coordinate where the
@@ -543,22 +560,27 @@ class OB:
         ----------
         segment : np.ndarray
             The 50 pixel row around the spectral pixel coordinate
-        leftwidth: int
-            The number of pixels from center to left edge
-        rightwidth: int
-            The number of pixels from center to right edge
+        cpix : int
+            The central pixel value
         """
         if np.array(segment == np.zeros_like(segment)).all():  # bad pixel rows
             return 0
-        ind, med, backmean = mean_back(segment)
-        cpix = self.recenter(segment, ind)
+        ind = np.arange(len(segment))  # an array of indices in the same length as the row
+        med = np.median(segment)  # the median of the row
+        w = self.inf_fix(1 / abs(med - segment))  # weights determined by distance from the median
+        # the closer the count to the median, the higher it is weighted, i.e. real signal and cosmic rays are supressed
+        pfit = np.poly1d(np.polyfit(ind, segment, 1, w=w))  # straight line fit weighted by distance from median
+        back = pfit(ind)  # values of the straight line fit
+        backmean = back.mean()  # the mean straight line value is the background
+        cpix = self.recenter(segment, cpix)
+        leftwidth, rightwidth = self.aperture_width(segment, cpix)
         minind = cpix - leftwidth
         maxind = cpix + rightwidth
         backsub = np.array([self.back_subtract(i, backmean) for i in segment])  # subtract the background from row
         signal = np.sum(backsub[minind + 1:maxind])  # sum up all the back subtracted signal in aperture
-        return signal
+        return signal, minind, cpix, maxind
 
-    def aperture_width(self, segment: np.ndarray) -> Tuple[int, int]:
+    def aperture_width(self, segment: np.ndarray, cpix: int) -> Tuple[int, int]:
         """Determines the aperture width to be used for the full extraction
 
         Takes a given line at approximately 8150A and determines the width of the aperture
@@ -568,10 +590,17 @@ class OB:
         ----------
         segment : np.ndarray
             The 50 pixel row around the spectral pixel coordinate
+        cpix : int
+            The central pixel
         """
-        ind, med, backmean = mean_back(segment)
+        ind = np.arange(len(segment))  # an array of indices in the same length as the row
+        med = np.median(segment)  # the median of the row
+        w = OB.inf_fix(1 / abs(med - segment))  # weights determined by distance from the median
+        # the closer the count to the median, the higher it is weighted, i.e. real signal and cosmic rays are supressed
+        pfit = np.poly1d(np.polyfit(ind, segment, 1, w=w))  # straight line fit weighted by distance from median
+        back = pfit(ind)  # values of the straight line fit
+        backmean = back.mean()  # the mean straight line value is the background
         backsub = np.array([self.back_subtract(i, backmean) for i in segment])  # subtract the background from row
-        cpix = self.recenter(segment, ind)
         relevel = 0.1 * backsub[cpix - 5:cpix + 6].max()  # 10 percent of the peak signal
         try:
             minind = np.argwhere(backsub[cpix - 5:cpix] < relevel)[-1][0] + cpix - 5  # lower aperture limit
@@ -583,7 +612,8 @@ class OB:
         rightwidth = maxind - cpix
         return leftwidth, rightwidth
 
-    def extract(self, data: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def extract(self, data: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray,
+                                                 np.ndarray, np.ndarray, np.ndarray]:
         """Extracts the spectrum
 
         Take a 50 pixel slice around the central pixel with a sub-section of rows selected from the CCD based on the
@@ -598,15 +628,26 @@ class OB:
         if self.resolution == 'R2500I':
             data = data[:, self.coordinate - 25:self.coordinate + 25]  # slicing spectra out
             pixels = np.arange(1, len(data) + 1)
-            dline = data[625].flatten()
+            # dline = data[625].flatten()
             # N.B. 'pixels' are used throughout but the pixel - 1 = python index has been done
         else:
             data = data[self.pixlow:self.pixhigh, self.coordinate - 25:self.coordinate + 25]  # slicing spectra
             pixels = np.arange(self.pixlow, self.pixhigh)
-            dline = data[1175 - self.pixlow].flatten()
-        lw, rw = self.aperture_width(dline)
-        peaks = np.stack([self.peak_average(data[i, :], lw, rw) for i in range(len(data))])  # create the peaks array
-        return pixels, peaks, data
+            # dline = data[1175 - self.pixlow].flatten()
+        # lw, rw = self.aperture_width(dline)
+        peaks, aptleft, aptcent, aptright = np.empty_like(pixels), np.empty_like(pixels),\
+            np.empty_like(pixels), np.empty_like(pixels)
+        for i, row in enumerate(data):
+            if not i:
+                cpix = len(row) // 2
+            else:
+                cpix = aptcent[i - 1]
+            peak_extract = self.peak_average(row, cpix)
+            peaks[i] = peak_extract[0]
+            aptleft[i] = peak_extract[1]
+            aptcent[i] = peak_extract[2]
+            aptright[i] = peak_extract[3]
+        return pixels, peaks, data, aptleft, aptcent, aptright
 
     @staticmethod
     def poisson(photon_count: np.ndarray) -> np.ndarray:
@@ -663,9 +704,8 @@ class OB:
         wave = wave[np.logical_and(wave >= np.min(wave_check), wave <= np.max(wave_check))]
         return wave, flux, error
 
-    @staticmethod
-    def vector_func(whichstd: str, wave: np.ndarray,
-                    flux: np.ndarray, error: np.ndarray) -> Tuple[np.ndarray,
+    def vector_func(self, whichstd: str, wave: np.ndarray,
+                    flux: np.ndarray, error: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray,
                                                                   np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Divides the standard by a model to get a vector constant
 
@@ -688,12 +728,13 @@ class OB:
         vegerr = np.ones_like(vegwave) * (np.std(vegflux) / len(vegflux))  # determine the error
         fluxfunction = sinterp.interp1d(vegwave, vegflux)  # linearly interpolate wavelength to flux
         errfunction = sinterp.interp1d(vegwave, vegerr)  # linearly interpolate wavelength to flux error
-        wave, flux, error = OB.confining_region(wave, flux, error, vegwave)  # constrain observation to the model
+        wave, flux, error = self.confining_region(wave, flux, error, vegwave)  # constrain observation to the model
+        vegfluxpre, vegerrpre = vegflux.copy(), vegerr.copy()
         vegflux = fluxfunction(wave)  # find the model fluxes from the interpolation at observation resolution
         vegerr = errfunction(wave)  # find the model errors from the interpolation at observation resolution
         ftoabs = flux / vegflux  # the calibration function as counts to absolute flux
-        comb_error = OB.calibrate_errorprop(ftoabs, error, vegerr, vegflux)  # propagate the error into function
-        return wave, flux, error, ftoabs, comb_error
+        comb_error = self.calibrate_errorprop(ftoabs, error, vegerr, vegflux)  # propagate the error into function
+        return wave, flux, error, ftoabs, comb_error, vegwave, vegfluxpre, vegerrpre
 
     @staticmethod
     def get_header_info(fname: str) -> Tuple[str, float, float, float]:
@@ -723,25 +764,56 @@ class OB:
         ptobest_std = f'Raw/{res}/{prog}/{obsblock}/stds/0*scopy.fits'
         ptobest_bias = f'Raw/{res}/{prog}/{obsblock}/bias/0*.fits'
         bias = self.bias(ptobest_bias)
+        self.axesstd[4].imshow(bias, cmap='plasma', origin='lower', aspect='auto')
         ptobest_flat = f'Raw/{res}/{prog}/{obsblock}/flat/0*.fits'
         flat = self.flat(ptobest_flat, bias)
+        self.axesstd[5].imshow(flat, cmap='plasma', origin='lower', aspect='auto')
+        self.axesstd[6].imshow(self.bpm, cmap='plasma', origin='lower', aspect='auto')
         standard_list = self.checkifspectra(glob.glob(ptobest_std))  # list of standards)
         sname = self.get_header_info(standard_list[-1])[0]  # gets name of standard
         sname = sname.split('_')[-1].lower().replace('-', '')  # converting standard name from header to model name
-        all_standards = np.stack([self.fopenbisub(bias, std) for std in standard_list])
+        all_standards = np.stack([self.fopener(obj) for obj in standard_list])
+        median_standard = self.med_stack(all_standards)  # median stack objects
+        self.axesstd[0].imshow(median_standard, cmap='cividis', origin='lower', aspect='auto')
+        self.axesstd[0].set_title(f'Median Stack ({len(all_standards)} standard/s)')
+        all_standards = np.stack([self.bisub(bias, std) for std in all_standards])
         median_standard = self.med_stack(all_standards)  # median stack the bias subtracted standards
+        self.axesstd[1].imshow(median_standard, cmap='cividis', origin='lower', aspect='auto')
         flat_standard = self.flat_field(flat, median_standard)  # flat field the standard
+        self.axesstd[2].imshow(flat_standard, cmap='cividis', origin='lower', aspect='auto')
         fixed_standard = self.inf_fix(flat_standard)  # fix infinite counts, acts as a bad pixel mask
-        pixel, photons, resid = self.extract(fixed_standard)  # extracts the spectra
+        self.axesstd[3].imshow(fixed_standard, cmap='cividis', origin='lower', aspect='auto')
+        pixel, photons, resid, aptleft, aptcent, aptright = self.extract(fixed_standard)  # extracts the spectra
+        aptleftdiff = aptcent - aptleft
+        aptrightdiff = aptright - aptcent
+        aptcent = aptcent - 25 + self.coordinate
+        aptleft = aptcent - aptleftdiff
+        aptright = aptcent + aptrightdiff
+        self.axesstd[7].imshow(resid, cmap='coolwarm', origin='lower', aspect='auto',
+                               extent=(self.coordinate - 25, self.coordinate + 25, self.pixlow, self.pixhigh))
+        self.axesstd[7].plot(aptleft, pixel, color='black', lw=1, ls='--')
+        self.axesstd[7].plot(aptright, pixel, color='black', lw=1, ls='--')
+        self.axesstd[7].plot(aptcent, pixel, color='black', lw=1, ls='-')
         error = self.poisson(photons)  # creating the errors
-        wave = self.transform(pixel)  # transform pixels to wavelength
-        wave, photons, error, ftoabs, ftoabs_error = self.vector_func(sname, wave, photons, error)  # vector constant
-        calib_standard = np.array((wave, photons, error))
+        self.axesstd[8].errorbar(pixel, photons, yerr=error)
+        wave, arcpix, arcwave = self.transform(pixel)  # transform pixels to wavelength
+        self.axesstd[9].errorbar(wave, photons, yerr=error)
+        self.axesstd[12].plot(arcpix, arcwave, color='red')
+        wave, photons, error, ftoabs, ftoabs_error,\
+            vegwave, vegflux, vegerr = self.vector_func(sname, wave, photons, error)  # vector constant
+        self.axesstd[10].errorbar(wave, photons, yerr=error)
+        self.axesstd[13].errorbar(vegwave, vegflux, yerr=vegerr, color='red')
+        self.axesstd[14].errorbar(wave, ftoabs, yerr=ftoabs_error, color='red')
+        wave, flux, error, sname = self.calibrate_real(wave, photons, error, sname, wave,
+                                                       ftoabs, ftoabs_error)  # real units spectra
+        self.axesstd[11].errorbar(wave, flux, yerr=error)
+        calib_standard = np.array((wave, flux, error))
         return ftoabs, calib_standard, ftoabs_error, sname, resid
 
     def calibrate_real(self, wave: np.ndarray,
                        photons: np.ndarray, error: np.ndarray,
-                       name: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, str]:
+                       name: str, wavereg: np.ndarray,
+                       ftoabs: np.ndarray, ftoabserr: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, str]:
         """Calibrates the object spectra with the model flux conversion
 
         This method takes the wavelength and counts given and converts the counts to an absolute flux at 10 parsecs.
@@ -758,6 +830,12 @@ class OB:
             The 1D array of target photon count error
         name : str
             The name of the target
+        wavereg : np.ndarray
+            Region constraining the wavelength looked at
+        ftoabs : np.ndarray
+            The calibration function
+        ftoabserr : np.ndarray
+            The calibration function error
         """
         dist_std = {'g191b2b': 59.88, 'gd140': 15.81, 'gd153': 63.0, 'gd248': 35.5,
                     'g158100': 461.42, 'ross640': 15.89, 'hilt600': 2541.3}  # the distances to all stds observed
@@ -765,12 +843,13 @@ class OB:
         tempname = name.split('_')[-1].lower().replace('-', '')  # if object is a standard convert it
         if tempname in dist_std.keys():
             name = tempname
-        wave, photons, error = self.confining_region(wave, photons, error, self.master_standard[0])  # constrict regime
-        flux = photons / self.ftoabs  # determine the absolute flux at the Earth
+        wave, photons, error = self.confining_region(wave, photons, error, wavereg)  # constrict regime
+        flux = photons / ftoabs  # determine the absolute flux at the Earth
         if self.resolution == 'R0300R':  # to correct for second order contamination
-            correction = np.loadtxt('R300R_correction_function.txt', unpack=True, usecols=(1, ))
+            # correction = np.loadtxt('R300R_correction_function.txt', unpack=True, usecols=(1, ))
+            correction = np.ones_like(flux)
             flux *= correction
-        error = self.calibrate_errorprop(flux, error, self.ftoabs_error, self.ftoabs)  # propagate the error on flux
+        error = self.calibrate_errorprop(flux, error, ftoabserr, ftoabs)  # propagate the error on flux
         return wave, flux, error, name
 
     def hum_air(self) -> Tuple[float, float, float]:
@@ -833,14 +912,38 @@ class OB:
         """
         object_list = self.checkifspectra(glob.glob(ptoobj))  # list of objects
         tname = self.get_header_info(object_list[-1])[0]
-        all_objects = np.stack([self.fopenbisub(self.master_bias, obj) for obj in object_list])
+        all_objects = np.stack([self.fopener(obj) for obj in object_list])
+        median_object = self.med_stack(all_objects)  # median stack objects
+        self.axesobj[0].imshow(median_object, cmap='cividis', origin='lower', aspect='auto')
+        self.axesobj[0].set_title(f'Median Stack ({len(all_objects)} object/s)')
+        all_objects = np.stack([self.bisub(self.master_bias, obj) for obj in all_objects])
         median_object = self.med_stack(all_objects)  # median stack bias subtracted objects
+        self.axesobj[1].imshow(median_object, cmap='cividis', origin='lower', aspect='auto')
         flat_object = self.flat_field(self.master_flat, median_object)  # flat field the object
+        self.axesobj[2].imshow(flat_object, cmap='cividis', origin='lower', aspect='auto')
         fixed_object = self.inf_fix(flat_object)  # fix infinite counts, acts as a bad pixel mask
-        pixel, photons, resid = self.extract(fixed_object)  # extracts spectra
+        self.axesobj[3].imshow(fixed_object, cmap='cividis', origin='lower', aspect='auto')
+        pixel, photons, resid, aptleft, aptcent, aptright = self.extract(fixed_object)  # extracts spectra
+        self.axesobj[7].imshow(resid, cmap='coolwarm', origin='lower', aspect='auto',
+                               extent=(self.coordinate - 25, self.coordinate + 25, self.pixlow, self.pixhigh))
+        aptleftdiff = aptcent - aptleft
+        aptrightdiff = aptright - aptcent
+        aptcent = aptcent - 25 + self.coordinate
+        aptleft = aptcent - aptleftdiff
+        aptright = aptcent + aptrightdiff
+        self.axesobj[7].plot(aptleft, pixel, color='black', lw=1, ls='--')
+        self.axesobj[7].plot(aptright, pixel, color='black', lw=1, ls='--')
+        self.axesobj[7].plot(aptcent, pixel, color='black', lw=1, ls='-')
         error = self.poisson(photons)  # creating the errors
-        wave = self.transform(pixel)  # transform pixels to wavelength
-        wave, flux, error, tname = self.calibrate_real(wave, photons, error, tname)  # real units spectra
+        self.axesobj[8].errorbar(pixel, photons, yerr=error)
+        wave, arcpix, arcwave = self.transform(pixel)  # transform pixels to wavelength
+        self.axesobj[9].errorbar(wave, photons, yerr=error)
+        self.axesobj[12].plot(arcpix, arcwave, color='red')
+        wave, flux, error, tname = self.calibrate_real(wave, photons, error, tname,
+                                                       self.master_standard[0],
+                                                       self.ftoabs, self.ftoabs_error)  # real units spectra
+        self.axesobj[10].errorbar(wave, flux, yerr=error)
+        self.axesobj[13].errorbar(wave, self.ftoabs, yerr=self.ftoabs_error, color='red')
         calib_spectra = np.array((wave, flux, error))
         return calib_spectra, tname, resid
 
@@ -975,7 +1078,7 @@ def repeat_check() -> None:
     return
 
 
-def main() -> None:
+def main():
     """Main control module
 
     All classes are controlled from here. It checks required files are present and accounted for.
@@ -1007,8 +1110,8 @@ def main() -> None:
         print('Made bad pixel masks.')
 
     # prompt user if they want to repeat all reductions #
-    do_all = input('Repeat all? y/[n]: ')
-    if do_all == 'y':
+    do_all = args.do_all
+    if do_all:
         if len(glob.glob('alt_redspec/**/*txt')) > 0:
             os.system("rm alt_redspec/**/*txt")  # delete the spectra
         f = open('alt_done.log', 'w+')  # empty the log file
@@ -1026,9 +1129,10 @@ def main() -> None:
             else:
                 done_list = np.append(done_list, True)
     ob_list = ob_list[done_list]
+    ob_list = [ob_list[0], ]
 
     # thread the unreduced files #
-    if len(ob_list) > 0:
+    if len(ob_list):
         avail_cores = multiprocessing.cpu_count() - 1 or 1  # available cores to thread over
         if len(ob_list) < avail_cores:
             avail_cores = len(ob_list)
@@ -1043,8 +1147,8 @@ def main() -> None:
         print(f'Process took {round(time.time() - t0, 1)} seconds.')
 
     # prompt user if they want to make all the plots
-    do_plot = input("Plot the spectra? [y]/n: ")
-    if do_plot in ('y', ''):
+    do_plot = args.do_plots
+    if do_plot:
         sys.dont_write_bytecode = True
         tplot0 = time.time()
         import alt_plot
@@ -1055,7 +1159,8 @@ def main() -> None:
 
 
 if __name__ == '__main__':  # if called as script, run main module
-    if len(sys.argv) == 2 and sys.argv[1] in ('--help', '-h'):  # if called command line 'python alt_reduce.py --help
-        print(__doc__)  # then print the documentation
-    else:
-        main()
+    myargs = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    myargs.add_argument('-a', '--do-all', action='store_true', default=False, help='Do all spectra?')
+    myargs.add_argument('-p', '--do-plots', action='store_true', default=False, help='Generate Further Plots?')
+    args = myargs.parse_args()
+    main()
