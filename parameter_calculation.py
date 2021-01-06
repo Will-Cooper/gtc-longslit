@@ -1,14 +1,24 @@
+"""
+A script to calculate astrophysical parameters from spectra
+"""
+import glob
+from typing import Tuple, Union
+import multiprocessing
+import argparse
+
 import splat
 import numpy as np
-import glob
-from typing import Tuple
 import scipy.interpolate as sinterp
 from astropy.table import Table
-import multiprocessing
 from astropy.io import fits
+import astropy.units as u
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
-import astropy.units as u
+from matplotlib import rcParams
+from bokeh.plotting import output_file, show, figure
+from bokeh.layouts import column
+from bokeh.models import Whisker, ColumnDataSource
+from bokeh.io import export_png
 
 
 class Full:
@@ -40,13 +50,20 @@ class Full:
 
     def expected_teff(self) -> int:
         """Determines the expected teff from the spectral type using Stephens et al. 2009"""
+        if self.spt == 0:
+            return 0
         s = self.spt - 60
         teff = 4400.9 - 467.26 * s + 54.67 * s ** 2 - 4.4727 * s ** 3 + 0.17767 * s ** 4 - 0.0025492 * s ** 5
-        return int(teff)
+        try:
+            return int(teff)
+        except np.ma.core.MaskError:
+            return 0
 
     def get_distance_spt(self) -> Tuple[float, float, str]:
         """Gets the name of the object"""
         t = Table.read('Master_info_correct_cm.csv')
+        t['jdksptnum'].fill_value = 0
+        t['truejdkspt'].fill_value = 'none'
         for row in t:
             if row['SHORTNAME'].strip() == self.name:
                 distance = row['dist']
@@ -184,7 +201,6 @@ class Full:
             all_chi = np.stack([self.davy_test(temp_wave, temp_flux, j[0], j[1]) for j in regions])
         else:
             all_chi = np.stack([self.grid_comp(temp_wave, temp_flux, i[0], i[1]) for i in regions])
-        #  w = np.array([1 / len(i) for i in regions])
         w = np.array([1, 1, 1, 2, 2, 2, 1, 2, 1, 1, 1, 1, 2, 2, 2])
         w = w[np.isfinite(all_chi)]
         all_chi = all_chi[np.isfinite(all_chi)]
@@ -240,14 +256,64 @@ def num_from_spt(spt: str) -> int:
     return num
 
 
+def spt_from_num(sptnum: Union[float, int]) -> str:
+    """Converts spectral type number to spectral type"""
+    def spt_make(sptype: str, sub: int) -> str:
+        """Joins strings"""
+        def round_val() -> str:
+            """Rounds values to nearest 0.5"""
+            val = sptnum - sub
+            if val >= 10:
+                raise ArithmeticError('Spectral type number incorrect')
+            rval = 0.5 * round(val / 0.5)
+            return str(rval)
+        return "".join([sptype, round_val()])
+    if sptnum < 70:
+        spt = spt_make('M', 60)  # M dwarf
+    elif sptnum < 80:
+        spt = spt_make('L', 70)  # L dwarf
+    elif sptnum < 90:
+        spt = spt_make('T', 80)  # T dwarf
+    else:
+        spt = spt_make('Y', 90)  # Y dwarf
+    if '.0' in spt:
+        return spt[:2]
+    else:
+        return spt
+
+
 def plot_typing(all_objects: list) -> None:
     """Plots on a multipage pdf the different objects and their determined spectral types"""
+    def normalise(arr: np.ndarray, idx: np.ndarray) -> float:
+        """Finds the median value of the normalisation region"""
+        norm_region = arr[idx]
+        return np.nanmedian(norm_region)
+
+    def get_norm(sptnumcheck: Union[float, int]) -> int:
+        """Gets the normalisation constant"""
+        if sptnumcheck < 70:
+            return 7500
+        else:
+            return 8150
+
+    def norm_idx(arr: np.ndarray) -> np.ndarray:
+        """Get the wavelength indices to be normalised by"""
+        return np.flatnonzero(np.logical_and(arr > norm - 50, arr < norm + 50))
+
+    def log_trim(arrwave: np.ndarray, arrflux: np.ndarray, arrfluxerr: np.ndarray = None):
+        """Trims arrays of tiny values after they've been normalised"""
+        idx = np.flatnonzero(arrflux > 0.01)
+        if arrfluxerr is None:
+            return arrwave[idx], arrflux[idx]
+        else:
+            return arrwave[idx], arrflux[idx], arrfluxerr[idx]
     pp = PdfPages('normalisation_typing.pdf')
     t = Table.read('physical_parameters.csv', format='csv')
     c = 1
     for f in all_objects:
         wave, flux, fluxerror = Full.load_target(f)
         name = f.split('_')[-1].strip('.txt')
+        res = f.split('/')[-1].split('_')[1]
         for row in t:
             if row['Name'] == name:
                 davytype = row['SpT']
@@ -255,32 +321,50 @@ def plot_typing(all_objects: list) -> None:
                 break
         else:
             davytype, mytype = '', ''
-        davytypenum = num_from_spt(davytype)
         mytypenum = num_from_spt(mytype)
-        twaved, tfluxd = Full.davy_open(davytypenum)
         twavem, tfluxm = Full.davy_open(mytypenum)
-        if davytypenum < 70:
-            norm = 7500
+        plt.figure(1)
+        try:
+            davytypenum = num_from_spt(davytype)
+        except ValueError:
+            davytypenum = 0
+            norm = get_norm(mytypenum)
         else:
-            norm = 8150
-        plt.figure(1, figsize=(15, 10))
-        wnorm = np.argwhere(wave > norm)[0][0]
-        twnormd = np.argwhere(twaved > norm)[0][0]
-        twnormm = np.argwhere(twavem > norm)[0][0]
-        normflux = flux / flux[wnorm]
-        wave = wave[np.isfinite(normflux)]
-        fluxerror = fluxerror[np.isfinite(normflux)]
-        normflux = normflux[np.isfinite(normflux)]
-        plt.plot(twaved, tfluxd / tfluxd[twnormd], label=f'{davytype}: By Eye', color='blue')
+            twaved, tfluxd = Full.davy_open(davytypenum)
+            norm = get_norm(davytypenum)
+            twnormd = norm_idx(twaved)
+            tfluxdnorm = normalise(tfluxd, twnormd)
+            tfluxd /= tfluxdnorm
+            twaved, tfluxd = log_trim(twaved, tfluxd)
+            plt.plot(twaved, tfluxd, label=f'{davytype}: By Eye', color='blue')
+        try:
+            pwave, pflux = np.loadtxt(f'old/prev_reduc/{name}.txt', unpack=True, skiprows=1)
+        except OSError:
+            pass
+        else:
+            pwnorm = norm_idx(pwave)
+            pfluxnorm = normalise(pflux, pwnorm)
+            # plt.errorbar(pwave, pflux / pfluxnorm, yerr=pfluxerr / pfluxnorm, label=f'{name} Previous', color='green')
+            pflux /= pfluxnorm
+            pwave, pflux = log_trim(pwave, pflux)
+            plt.plot(pwave, pflux, label=f'{name} Previous', color='green')
+        wnorm = norm_idx(wave)
+        twnormm = norm_idx(twavem)
+        normflux = normalise(flux, wnorm)
+        tfnormm = normalise(tfluxm, twnormm)
+        flux /= normflux
+        wave, flux, fluxerror = log_trim(wave, flux, fluxerror)
+        tfluxm /= tfnormm
+        twavem, tfluxm = log_trim(twavem, tfluxm)
         if mytypenum != davytypenum:
-            plt.plot(twavem, tfluxm / tfluxm[twnormm], label=f'{mytype}: Normalized Fit', color='orange')
-        plt.errorbar(wave, normflux, yerr=fluxerror / flux[wnorm], label=f'{name}', color='black')
+            plt.plot(twavem, tfluxm, label=f'{mytype}: Normalised Fit', color='orange')
+        plt.errorbar(wave, flux, yerr=fluxerror, label=f'{name} - {res}', color='black')
         plt.legend()
-        plt.ylim([-0.5, 8])
         plt.ylabel(f'Flux Normalized at {norm} Angstroms')
         plt.xlabel('Wavelength (Angstroms)')
         plt.title(f'{name}')
-        pp.savefig()
+        plt.yscale('log')
+        pp.savefig(bbox_inches='tight')
         plt.close()
         c += 1
     pp.close()
@@ -298,22 +382,121 @@ def object_list_sort(all_objects: list) -> list:
     return out_objects
 
 
-def indices_plotting(indices_list: list) -> None:
+def indices_plotting(indices_list: list):
     """Plots the spectral indices calculated"""
+    def source_split(r: str) -> ColumnDataSource:
+        res_bool = reses == r
+        xvals = sptypes[res_bool]
+        yvals = ind_vals[res_bool]
+        nvals = names[res_bool]
+        res_arr = reses[res_bool]
+        errvals = ind_valerr[res_bool]
+        uptop = upper[res_bool]
+        botlow = lower[res_bool]
+        return ColumnDataSource(data=dict(x=xvals, y=yvals, obj_name=nvals, resolution=res_arr, err=errvals,
+                                          upper=uptop, lower=botlow))
+    if len(indices_list) == 0:
+        raise FileNotFoundError('Appears to be empty list')
     tdata = Table.read('physical_parameters.csv', format='csv')
     inds = ["Rb-a", "Rb-b", "Na-a", "Na-b", "Cs-a", "Cs-b", "TiO-a", "TiO-b", "VO-a", "VO-b", "CrH-a", "CrH-b", "FeH-a",
             "FeH-b", "Color-a", "Color-b", "Color-c", "Color-d", "PC3", "PC6", "CrH1", "CrH2", "FeH1", "FeH2", "H2O1",
             "TiO1", "TiO2", "VO1", "VO2"]
+    numinds = len(inds)
+    indserr = ["".join([i, '_err']) for i in inds]
+    output_file('indices_plotted.html', title='Spectral Indices')
+    tplot = Table(names=['name', 'sptnum', 'resolution'] + inds + indserr)
+    tplot['name'].dtype = 'U12'
+    tplot['resolution'].dtype = 'U8'
     for f in indices_list:
         t = Table.read(f, format='csv')
         name = f.split('/')[-1].split('_')[0]
         for row in tdata:
             if name == row['Name']:
-                sptnum = row['sptnum']
+                try:
+                    sptnum = num_from_spt(row['SpT'])
+                except ValueError:
+                    sptnum = num_from_spt(row['MySpT'])
+                res = row['Res']
                 break
         else:
             sptnum = 0
-        # TODO: Finish this
+            res = ''
+        if sptnum == 0:
+            continue
+        row = np.empty_like(tplot.colnames)
+        for i, col in enumerate(tplot.colnames):
+            if 'err' in col:
+                break
+            elif i == 0:
+                row[i] = name
+            elif i == 1:
+                row[i] = sptnum
+            elif i == 2:
+                row[i] = res
+            else:
+                try:
+                    val, err = t[col]
+                except KeyError:
+                    row[i] = np.nan
+                    row[i + numinds] = np.nan
+                else:
+                    row[i] = float(f'{val:.4f}')
+                    row[i + numinds] = float(f'{err:.4f}')
+        tplot.add_row(row)
+    sptypes = tplot['sptnum']
+    minspt, maxspt = np.floor(np.min(sptypes)), np.ceil(np.max(sptypes))
+    xlims = np.linspace(minspt, maxspt, int(maxspt - minspt + 1), dtype=int)
+    names = np.array(tplot['name'])
+    reses = np.array(tplot['resolution'])
+    glyphs, sptdict = [], {}
+    tooltips = [('Name', '@obj_name'), ('Spectral Index', '@y +/- @err'), ('Resolution', '@resolution')]  # hover tool
+    for i in xlims:
+        sptdict[int(i)] = spt_from_num(i)
+    for i in inds:
+        ind_vals = np.array(tplot[i])
+        if np.all(np.isnan(ind_vals)):
+            continue
+        ind_valerr = np.array(tplot["".join([i, '_err'])])
+        upper = ind_vals + ind_valerr
+        lower = ind_vals - ind_valerr
+        pfit = np.polyfit(sptypes[np.logical_not(np.isnan(ind_vals))], ind_vals[np.logical_not(np.isnan(ind_vals))], 4)
+        p1d = np.poly1d(pfit)
+        p = figure(tools="pan,hover,box_zoom,reset,wheel_zoom,save", tooltips=tooltips, active_drag='box_zoom',
+                   title=i, x_axis_label='Spectral Type', y_axis_label='Spectral Index',
+                   plot_height=366, plot_width=488)
+        sourcer25 = source_split('R2500I')
+        p.circle(source=sourcer25, x='x', y='y', color='blue', size=8,
+                 legend_label='R2500I', muted_color='blue', muted_alpha=0.1)
+        p.add_layout(Whisker(source=sourcer25, base="y", upper="upper", lower="lower",
+                             dimension='height', level='overlay', line_color='blue'))
+        sourcer03 = source_split('R0300R')
+        p.square(source=sourcer03, x='x', y='y', color='orange', size=6,
+                 alpha=0.75, legend_label='R300R', muted_color='orange', muted_alpha=0.1)
+        p.add_layout(Whisker(source=sourcer03, base="y", upper="upper", lower="lower",
+                             dimension='height', level='overlay', line_color='orange'))
+        xfit = np.linspace(minspt, maxspt, 100)
+        p.line(xfit, p1d(xfit), color='black', line_dash='dashed', alpha=0.5)
+        p.xaxis.ticker = xlims
+        p.xaxis.major_label_overrides = sptdict
+        p.hover.mode = 'mouse'
+        p.legend.click_policy = "mute"
+        p.sizing_mode = 'stretch_width'
+        p.title.align = 'center'
+        p.title.text_font_size = '18pt'
+        p.title.text_font_style = 'bold'
+        p.min_border_left = 60
+        p.min_border_right = 60
+        p.xaxis.axis_label_text_font_size = '16pt'
+        p.yaxis.axis_label_text_font_size = '16pt'
+        p.xaxis.major_label_text_font_size = '16pt'
+        p.yaxis.major_label_text_font_size = '16pt'
+        p.legend.label_text_font_size = '16pt'
+        glyphs.append(p)
+    tplot.write('plotted_indices.csv', overwrite=True)
+    if use_png:
+        export_png(column(glyphs, sizing_mode='scale_width'))
+    else:
+        show(column(glyphs, sizing_mode='scale_width'))
     return
 
 
@@ -321,8 +504,6 @@ def main():
     """Main module"""
     all_objects = glob.glob('alt_redspec/objects/*txt')
     all_objects = object_list_sort(all_objects)
-
-    do_parameters = True
     if do_parameters:
         with open('physical_parameters.csv', 'w+') as f:
             f.write('Name,Res,SpT,MySpT,sptnum,ExpectTeff,'
@@ -335,12 +516,34 @@ def main():
         t = Table.read('physical_parameters.csv', format='csv')
         t.sort('Name')
         t.write('physical_parameters.csv', format='csv', overwrite=True)
-
-    do_plot = True
     if do_plot:
         plot_typing(all_objects)
+        indices_plotting(glob.glob('spectral_indices/*csv'))
     return
 
 
 if __name__ == '__main__':
-    main()
+    rcParams.update({'axes.labelsize': 'small', 'axes.titlesize': 'small',
+                     'xtick.labelsize': 'small', 'ytick.labelsize': 'small',
+                     'legend.fontsize': 'small', 'font.serif': ['Helvetica', 'Arial',
+                                                                'Tahoma', 'Lucida Grande',
+                                                                'DejaVu Sans'],
+                     'font.family': 'serif', 'legend.frameon': False, 'legend.facecolor': 'none',
+                     'mathtext.fontset': 'cm', 'mathtext.default': 'regular',
+                     'figure.figsize': [4, 3], 'figure.dpi': 144, 'lines.linewidth': .75,
+                     'xtick.top': True, 'ytick.right': True, 'legend.handletextpad': 0.5,
+                     'xtick.minor.visible': True, 'ytick.minor.visible': True})
+    myargs = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    myargs.add_argument('-a', '--astrophysical-parameters', action='store_true', default=False, help='Calculate params')
+    myargs.add_argument('-p', '--create-plots', action='store_true', default=False, help='Make plots')
+    myargs.add_argument('-i', '--indices-only', action='store_true', default=False, help='Only plot indices')
+    myargs.add_argument('-png', '--export-png', action='store_true', default=False, help='Export indices as png')
+    args = myargs.parse_args()
+    do_parameters = args.astrophysical_parameters
+    do_plot = args.create_plots
+    only_indices_plotting = args.indices_only
+    use_png = args.export_png
+    if only_indices_plotting:
+        indices_plotting(glob.glob('spectral_indices/*csv'))
+    else:
+        main()
