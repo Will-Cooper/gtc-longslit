@@ -43,7 +43,7 @@ import numpy as np  # general mathematics and array handling
 from astropy.io import fits  # opening multiple HDU fits files
 from astropy.table import Table  # opening files as data tables
 # from astropy.modeling import models, fitting
-import scipy.interpolate as sinterp  # for interpolation (we use linear)
+# import scipy.interpolate as sinterp  # for interpolation (we use linear)
 from scipy.optimize import curve_fit, OptimizeWarning
 import matplotlib.pyplot as plt
 from matplotlib import rc, rcParams
@@ -59,6 +59,7 @@ import multiprocessing  # used to overcome the inherent python GIL
 import time  # timing processing
 from typing import Tuple  # used for type hinting
 import os
+import json
 
 
 class OB:
@@ -210,15 +211,18 @@ class OB:
             self.logger(f'There are {len(glob.glob(self.ptobias))} bias files')
             self.master_bias = self.bias(self.ptobias)  # creates the master bias file
             pbar.update(5)
-            self.axesobj[4].imshow(self.master_bias, cmap='coolwarm', norm=imgnorm, origin='lower', aspect='auto')
+            biasplot = self.axesobj[4].imshow(self.master_bias, cmap='BuPu', origin='lower', aspect='auto')
+            plt.colorbar(biasplot, ax=self.axesobj[4])
             self.ptoflats = ptodata + '/flat/0*fits'  # path to flats
             self.logger(f'There are {len(glob.glob(self.ptoflats))} flats files')
             self.master_flat = self.flat(self.ptoflats, self.master_bias)  # creates the master flat file
             pbar.update(5)
-            self.axesobj[5].imshow(self.master_flat, cmap='coolwarm', norm=imgnorm, origin='lower', aspect='auto')
+            flatplot = self.axesobj[5].imshow(self.master_flat, cmap='BuPu', origin='lower', aspect='auto')
+            plt.colorbar(flatplot, ax=self.axesobj[5])
             self.bpm = self.bpm_applying(np.ones_like(self.master_flat))
             pbar.update(5)
-            self.axesobj[6].imshow(self.bpm, cmap=ccd_bincmap, origin='lower', aspect='auto')
+            bpmplot = self.axesobj[6].imshow(self.bpm, cmap=ccd_bincmap, origin='lower', aspect='auto')
+            plt.colorbar(bpmplot, ax=self.axesobj[6])
             self.ptoobj = ptodata + '/object/0*fits'  # path to object
             self.logger(f'There are {len(glob.glob(self.ptoobj))} object files')
             self.humidity, self.airmass, self.mjd = self.hum_air()  # average humidity and airmass of object obs
@@ -229,9 +233,12 @@ class OB:
             self.ptoarcs = ptodata + '/arc/0*fits'  # path to arcs
             self.logger(f'There are {len(glob.glob(self.ptoarcs))} arcs files')
             self.logger('The standard is being reduced and analysed:')
+            self.haveaperture = False
             self.ftoabs, self.master_standard, self.ftoabs_error, self.standard_name, \
             self.standard_residual, self.stdobs, \
-            self.stdres, self.stdprog = self.standard()  # reduces the closest standard to target
+            self.stdres, self.stdprog,\
+            self.cpix, self.aptleft, self.aptright = self.standard()  # reduces the closest standard to target
+            self.haveaperture = True
             pbar.update(35)
             self.actual_standard = self.standard_name
             self.logger(f'Name of standard being used was {self.standard_name.upper()}')
@@ -669,21 +676,21 @@ class OB:
             The modal background count representing the sky
         """
         backmode = np.nanmedian(segment)  # start with median value as background
-        i = 5  # start bin size as 5
+        i = len(segment)  # start bin size as segment length
         significant = False
         while not significant:
             hist, edges = np.histogram(segment, bins=i)  # bin the values
             significant = np.max(hist) > np.mean(hist) + np.std(hist) * 2  # if the mode is 2 sigma above the mean
-            if i == len(segment):  # if the number of bins = number of pixels
+            if i == 5:  # if the number of bins = number of pixels
                 significant = True
             if significant:  # if either of last two true
                 modeind = np.argmax(hist)  # which index has the modal value
                 backmode = np.mean(edges[modeind: modeind + 2])  # the mean value of that bin is the background
             else:
-                i += 5  # increase bin size by 5 if the mode is not yet significant
+                i -= 5  # decrease bin size by 5 if the mode is not yet significant
         return backmode
 
-    def peak_average(self, segment: np.ndarray, cpix: int) -> Tuple[float, int, int, int]:
+    def peak_average(self, segment: np.ndarray, cpix: int, ind: int, jdict: dict) -> Tuple[float, int, int, int, dict]:
         """Takes the strip of the CCD and gets the median around the peak
 
         This method extracts the full signal. It is given a 50 pixel row centered on the pixel coordinate where the
@@ -699,47 +706,55 @@ class OB:
             The 50 pixel row around the spectral pixel coordinate
         cpix : int
             The central pixel value
+        ind : int
+            Index along dispersion axis
+        jdict : dict
+            Dictionary of extraction results
         """
+        jdict[ind] = thisdict = {}
+        cpix = round(cpix)
         if np.array(segment == np.zeros_like(segment)).all():  # bad pixel rows
             return 0, 25, 25, 25
         backmode = self.find_back(segment)
-        # cpix = self.recenter(segment, cpix)
-        leftwidth, rightwidth = self.aperture_width(segment, cpix)
+        if self.haveaperture:
+            leftwidth, rightwidth = self.aptleft[ind], self.aptright[ind]
+        else:
+            leftwidth, rightwidth = 10, 10
         minind = cpix - leftwidth if cpix - leftwidth >= 0 else 0
         maxind = cpix + rightwidth if cpix + rightwidth <= len(segment) else len(segment)
         backsub = np.array([self.back_subtract(i, backmode) for i in segment])  # subtract the background from row
-        # signal = np.trapz(backsub[minind + 1:maxind], x=ind[minind + 1:maxind])  # sum subtracted signal in aperture
         minreg = np.min(np.abs(backsub))
-        region = np.abs(np.subtract(backsub[int(minind): int(maxind) + 1], minreg))
-        amp = np.max(region[len(region) // 2 - 2: len(region) // 2 + 3])
-        xsmall = np.arange(int(minind), int(maxind) + 1)
+        region = np.abs(np.subtract(backsub, minreg)).astype(float)
+        xsmall = np.arange(len(region), dtype=float)
+        xbig = np.linspace(0, len(region), 1000, endpoint=False, dtype=float)
+        amp = np.nanmax(region[minind: maxind])
+        thisdict['xsmall'] = xsmall.tolist()
+        thisdict['xbig'] = xbig.tolist()
+        yvals = np.interp(xbig, xsmall, region)
+        thisdict['region'] = segment.tolist()
+        thisdict['ybig'] = (yvals + backmode + minreg).tolist()
         p0 = [amp, cpix, 2]
         try:
-            gfit = curve_fit(self.gaussian, xsmall, region, p0=p0,
-                             bounds=([0, cpix - 2, 0.5], [1.2 * amp, cpix + 2, 2]))[0]
+            gfit = curve_fit(self.gaussian, xbig, yvals, p0=p0,
+                             bounds=([0, minind, 0.5], [1.2 * amp, maxind, 3]))[0]
         except ValueError:
-            # raise ValueError(f'{e} {amp} {xsmall} {minind} {cpix} {maxind} {region}')
             gfit = p0
         except RuntimeError:
             gfit = p0
-        xbig = np.linspace(int(minind), int(maxind) + 1, 100)
         yvals = self.gaussian(xbig, *gfit)
-        ystd = np.std(yvals)
-        hwhm = np.sqrt(2 * np.log(2)) * ystd
-        cpix = gfit[1]
-        cpix_mhwhm = cpix - 0.75 * hwhm
-        try:
-            cpix_mhwhm = np.flatnonzero(xbig > cpix_mhwhm)[0]
-        except IndexError:
-            cpix_mhwhm = 0
-        cpix_phwhm = cpix + 0.75 * hwhm
-        try:
-            cpix_phwhm = np.flatnonzero(xbig > cpix_phwhm)[0]
-        except IndexError:
-            cpix_phwhm = -1
-        signal = np.trapz(yvals[cpix_mhwhm: cpix_phwhm]) + minreg
-        cpix = round(cpix)
-        return signal, minind, cpix, maxind, backmode
+        xstd = gfit[2]
+        hwhm = np.sqrt(2 * np.log(2)) * xstd
+        bigcpix = cpix = gfit[1]
+        bigcpix_mhwhm = bigcpix - 0.75 * hwhm
+        bigcpix_phwhm = bigcpix + 0.75 * hwhm
+        cpix_mhwhm = np.flatnonzero(xsmall > bigcpix_mhwhm)[0]
+        cpix_phwhm = np.flatnonzero(xsmall > bigcpix_phwhm)[0]
+        bpix_lowind = np.flatnonzero(xbig > bigcpix_mhwhm)[0]
+        bpix_highind = np.flatnonzero(xbig > bigcpix_phwhm)[0]
+        thisdict['yfit'] = (yvals + backmode + minreg).tolist()
+        thisdict['params'] = [bigcpix_mhwhm, bigcpix, bigcpix_phwhm, amp, minreg, backmode]
+        signal = np.trapz(yvals[bpix_lowind: bpix_highind] + minreg)
+        return signal, cpix_mhwhm, cpix, cpix_phwhm, backmode, jdict
 
     def aperture_width(self, segment: np.ndarray, cpix: int) -> Tuple[int, int]:
         """Determines the aperture width to be used for the full extraction
@@ -774,8 +789,8 @@ class OB:
         rightwidth = maxind - cpix if maxind - cpix > 1 else 1
         return leftwidth, rightwidth
 
-    def extract(self, data: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray,
-                                                 np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def extract(self, data: np.ndarray, jdict: dict) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray,
+                                                              np.ndarray, np.ndarray, np.ndarray, dict]:
         """Extracts the spectrum
 
         Take a 50 pixel slice around the central pixel with a sub-section of rows selected from the CCD based on the
@@ -786,6 +801,8 @@ class OB:
         ----------
         data : np.ndarray
             The full CCD of the observation, to be sliced and extracted from
+        jdict : dict
+            Dictionary of extraction results
         """
         if self.resolution == 'R2500I':
             data = data[self.pixlow:self.pixhigh, self.coordinate - 50:self.coordinate + 51]  # slicing spectra out
@@ -804,13 +821,14 @@ class OB:
                 cpix = len(row) // 2
             else:
                 cpix = aptcent[i - 1]
-            peak_extract = self.peak_average(row, cpix)
+            peak_extract = self.peak_average(row, cpix, i, jdict)
             peaks[i] = peak_extract[0]
             aptleft[i] = peak_extract[1]
             aptcent[i] = peak_extract[2]
             aptright[i] = peak_extract[3]
             background[i] = peak_extract[4]
-        return pixels, peaks, data, aptleft, aptcent, aptright, background
+            jdict = peak_extract[5]
+        return pixels, peaks, data, aptleft, aptcent, aptright, background, jdict
 
     @staticmethod
     def poisson(photon_count: np.ndarray) -> np.ndarray:
@@ -889,15 +907,18 @@ class OB:
         """
         vegwave, vegflux = np.loadtxt(f'calib_models/{whichstd}_mod.txt', unpack=True)  # load the model
         vegerr = np.ones_like(vegwave) * (np.std(vegflux) / len(vegflux))  # determine the error
-        fluxfunction = sinterp.interp1d(vegwave, vegflux)  # linearly interpolate wavelength to flux
-        errfunction = sinterp.interp1d(vegwave, vegerr)  # linearly interpolate wavelength to flux error
-        wave, flux, error = self.confining_region(wave, flux, error, vegwave)  # constrain observation to the model
-        vegfluxpre, vegerrpre = vegflux.copy(), vegerr.copy()
-        vegflux = fluxfunction(wave)  # find the model fluxes from the interpolation at observation resolution
-        vegerr = errfunction(wave)  # find the model errors from the interpolation at observation resolution
+        # fluxfunction = sinterp.interp1d(vegwave, vegflux)  # linearly interpolate wavelength to flux
+        # errfunction = sinterp.interp1d(vegwave, vegerr)  # linearly interpolate wavelength to flux error
+        # wave, flux, error = self.confining_region(wave, flux, error, vegwave)  # constrain observation to the model
+        # vegfluxpre, vegerrpre = vegflux.copy(), vegerr.copy()
+        # vegflux = fluxfunction(wave)  # find the model fluxes from the interpolation at observation resolution
+        # vegerr = errfunction(wave)  # find the model errors from the interpolation at observation resolution
+        vegflux = np.interp(wave, vegwave, vegflux)
+        vegerr = np.interp(wave, vegwave, vegerr)
+        vegwave = np.interp(wave, vegwave, vegwave)
         ftoabs = flux / vegflux  # the calibration function as counts to absolute flux
         comb_error = self.calibrate_errorprop(ftoabs, error, vegerr, vegflux)  # propagate the error into function
-        return wave, flux, error, ftoabs, comb_error, vegwave, vegfluxpre, vegerrpre
+        return wave, flux, error, ftoabs, comb_error, vegwave, vegflux, vegerr
 
     @staticmethod
     def get_header_info(fname: str) -> Tuple[str, float, float, float]:
@@ -912,7 +933,8 @@ class OB:
             head = hdul[0].header  # the observational information on OSIRIS is on the first HDU
         return head['OBJECT'].rstrip(), head['HUMIDITY'], head['AIRMASS'], head['MJD-OBS']
 
-    def standard(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, str, np.ndarray, str, str, str]:
+    def standard(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, str, np.ndarray,
+                                str, str, str, np.ndarray, np.ndarray, np.ndarray]:
         """Reduces standard and creates conversion to absolute units
 
         This method finds the closest standards observation block to the observation in terms of airmass and humidity
@@ -932,12 +954,15 @@ class OB:
         ptobest_bias = f'Raw/{res}/{prog}/{obsblock}/bias/0*.fits'
         self.logger(f'The standard has {len(glob.glob(ptobest_bias))} bias files')
         bias = self.bias(ptobest_bias)
-        self.axesstd[4].imshow(bias, cmap='coolwarm', norm=imgnorm, origin='lower', aspect='auto')
+        biasplot = self.axesstd[4].imshow(bias, cmap='BuPu', origin='lower', aspect='auto')
+        plt.colorbar(biasplot, ax=self.axesstd[4])
         ptobest_flat = f'Raw/{res}/{prog}/{obsblock}/flat/0*.fits'
         self.logger(f'The standard has {len(glob.glob(ptobest_flat))} flats files')
         flat = self.flat(ptobest_flat, bias)
-        self.axesstd[5].imshow(flat, cmap='coolwarm', norm=imgnorm, origin='lower', aspect='auto')
-        self.axesstd[6].imshow(self.bpm, cmap=ccd_bincmap, origin='lower', aspect='auto')
+        flatplot = self.axesstd[5].imshow(flat, cmap='BuPu', origin='lower', aspect='auto')
+        plt.colorbar(flatplot, ax=self.axesstd[5])
+        bpmplot = self.axesstd[6].imshow(self.bpm, cmap=ccd_bincmap, origin='lower', aspect='auto')
+        plt.colorbar(bpmplot, ax=self.axesstd[6])
         standard_list = self.checkifspectra(glob.glob(ptobest_std))  # list of standards)
         sname = self.get_header_info(standard_list[-1])[0]  # gets name of standard
         sname = sname.split('_')[-1].lower().replace('-', '')  # converting standard name from header to model name
@@ -952,7 +977,14 @@ class OB:
         self.axesstd[2].imshow(flat_standard, cmap='coolwarm', norm=imgnorm, origin='lower', aspect='auto')
         fixed_standard = self.inf_fix(flat_standard)  # fix infinite counts, acts as a bad pixel mask
         self.axesstd[3].imshow(fixed_standard, cmap='coolwarm', norm=imgnorm, origin='lower', aspect='auto')
-        pixel, photons, resid, aptleft, aptcent, aptright, back = self.extract(fixed_standard)  # extract spectra
+        with open(f'alt_redspec/jsons/{obsblock}_{res}_{prog}_{sname}.json', 'w') as jfile:
+            json.dump({}, jfile)
+        with open(f'alt_redspec/jsons/{obsblock}_{res}_{prog}_{sname}.json', 'r') as jfile:
+            jdict = json.load(jfile)
+        pixel, photons, resid, aptleft, aptcent, aptright, back, jdict = self.extract(fixed_standard, jdict)
+        with open(f'alt_redspec/jsons/{obsblock}_{res}_{prog}_{sname}.json', 'w') as jfile:
+            json.dump(jdict, jfile)
+        outcpix = aptcent
         aptleftdiff = aptcent - aptleft
         aptrightdiff = aptright - aptcent
         aptcent = aptcent - 50 + self.coordinate
@@ -983,7 +1015,8 @@ class OB:
         self.axesstd[11].errorbar(wave, flux, yerr=error)
         calib_standard = np.array((wave, flux, error))
         # self.figstd.suptitle(f'{obsblock} {res} {prog} {sname}')
-        return ftoabs, calib_standard, ftoabs_error, sname, resid, obsblock, res, prog
+        return ftoabs, calib_standard, ftoabs_error, sname, resid, obsblock, res, prog,\
+            outcpix, aptleftdiff, aptrightdiff
 
     def calibrate_real(self, wave: np.ndarray,
                        photons: np.ndarray, error: np.ndarray,
@@ -1097,7 +1130,13 @@ class OB:
         self.axesobj[2].imshow(flat_object, cmap='coolwarm', norm=imgnorm, origin='lower', aspect='auto')
         fixed_object = self.inf_fix(flat_object)  # fix infinite counts, acts as a bad pixel mask
         self.axesobj[3].imshow(fixed_object, cmap='coolwarm', norm=imgnorm, origin='lower', aspect='auto')
-        pixel, photons, resid, aptleft, aptcent, aptright, back = self.extract(fixed_object)  # extracts spectra
+        with open(f'alt_redspec/jsons/{self.ob}_{self.resolution}_{self.prog}_{tname}.json', 'w') as jfile:
+            json.dump({}, jfile)
+        with open(f'alt_redspec/jsons/{self.ob}_{self.resolution}_{self.prog}_{tname}.json', 'r') as jfile:
+            jdict = json.load(jfile)
+        pixel, photons, resid, aptleft, aptcent, aptright, back, jdict = self.extract(fixed_object, jdict)
+        with open(f'alt_redspec/jsons/{self.ob}_{self.resolution}_{self.prog}_{tname}.json', 'w') as jfile:
+            json.dump(jdict, jfile)
         reducplot = self.axesobj[7].imshow(resid, cmap='coolwarm', norm=imgnorm, origin='lower', aspect='auto',
                                            extent=(
                                            self.coordinate - 25, self.coordinate + 26, self.pixlow, self.pixhigh))
@@ -1183,6 +1222,7 @@ class OB:
             for ax in axes[8:10]:
                 ax.set_ylabel('Counts')
                 ax.set_yscale('log')
+            axes[9].set_yscale('linear')
             axes[9].set_xlabel(r'$\lambda\ [\AA]$')
             axes[12].set_xlabel('Y Pixel [pixel]')
             axes[12].set_ylabel(r'$\lambda\ [\AA]$')
@@ -1190,8 +1230,9 @@ class OB:
         self.axesobj[10].set_xlabel(r'$\lambda\ [\AA]$')
         self.axesobj[10].set_ylabel(r'$F_{\lambda}\ [\mathrm{erg}\ \mathrm{cm}^{-1}\ s^{-1}\ \AA^{-1}]$')
         self.axesstd[10].set_title('Wavelength Calibrated')
-        self.axesstd[10].set_xlabel('X Pixel [pix]')
-        self.axesstd[10].set_ylabel('Y Pixel [pix]')
+        self.axesstd[10].set_xlabel(r'$\lambda\ [\AA]$')
+        self.axesstd[10].set_ylabel('Counts')
+        self.axesstd[10].set_yscale('linear')
         self.axesobj[13].set_title('Calibration Function')
         self.axesobj[13].set_xlabel(r'$\lambda\ [\AA]$')
         self.axesobj[13].set_ylabel(r'$\mathrm{Counts}\ F_{\lambda}^{-1}\ [\mathrm{erg}^{-1}\ \mathrm{cm}\ s\ \AA]$')
@@ -1201,6 +1242,7 @@ class OB:
         self.axesstd[13].set_title('Model')
         self.axesstd[13].set_xlabel(r'$\lambda\ [\AA]$')
         self.axesstd[13].set_ylabel(r'$F_{\lambda}\ [\mathrm{erg}\ \mathrm{cm}^{-1}\ s^{-1}\ \AA^{-1}]$')
+        self.axesstd[13].set_yscale('linear')
         self.axesstd[14].set_title('Calibration Function')
         self.axesstd[14].set_xlabel(r'$\lambda\ [\AA]$')
         self.axesstd[14].set_ylabel(r'$\mathrm{Counts}\ F_{\lambda}^{-1}\ [\mathrm{erg}^{-1}\ \mathrm{cm}\ s\ \AA]$')

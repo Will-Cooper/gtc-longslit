@@ -45,6 +45,7 @@ def davy_open(sptnum):
 
 def main():
     """Main module"""
+    global flist, title, labs, spt, normpoint
     myargs = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     myargs.add_argument('-n', '--normalise', type=int, default=False, help='Normalise Point in Angstroms')
     myargs.add_argument('-f', '--files', required=True, nargs='+', help='Files to be plotted')
@@ -56,6 +57,11 @@ def main():
     flist = args.files
     title = args.title
     labs = args.legend
+    if labs is None:
+        doleg = False
+        labs = [None, ] * len(flist)
+    else:
+        doleg = True
     spt = args.spectral_type
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 5), dpi=244)
     if not title:
@@ -112,7 +118,8 @@ def main():
     ax2.set_xlabel(r'Wavelength $\AA$')
     ax2.set_ylabel(r'$\lambda F_{\lambda}$')
     ax2.set_yscale('log')
-    ax1.legend()
+    if doleg:
+        ax1.legend()
     plt.subplots_adjust(hspace=0.5)
     plt.show()
     return
