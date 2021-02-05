@@ -106,12 +106,12 @@ ax.set_xlabel('Row')
 ax.set_ylabel('Count')
 ax.legend()
 print('initialised')
-ani = animation.FuncAnimation(fig, animate, frames=jdict, interval=16, init_func=animinit,
+ani = animation.FuncAnimation(fig, animate, frames=jdict, interval=33, init_func=animinit,
                               blit=True, save_count=len(jdict), repeat=False)
 fnames = fname.split('/')
 fnameout = '/'.join(fnames[:-1]) + '/vids/' + fnames[-1][:fnames[-1].find('.json')] + '.mp4'
 print('running...')
 if dosave:
-    ani.save(fnameout, writer=animation.FFMpegWriter(fps=60))
+    ani.save(fnameout, writer=animation.FFMpegWriter(fps=30))
 else:
     plt.show()

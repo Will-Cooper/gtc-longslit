@@ -14,8 +14,6 @@ It will search for spectra in the current directory sub-folder 'Raw/' in which w
 Required non script files/ folders in the same directory as this script include:
     * Master_info_correct_cm.csv    -- Containing the filenames, programme IDs, observing blocks, resolutions,
                                        shortnames, distances, spectral type and spectral type number.
-    * observing_qc_positions_parseable.txt  -- Containing the programme IDs, observing bocks, resolutions
-                                               and x pixel where the spectra is on the image (default is 250).
     * calib_models/     -- Containing the WD models that correspond with the observed standards
     * alt_done.log      -- An empty text file to be filled with the files that have been reduced already
     * good_wds.txt      -- A descriptive file of which standards per observing block should be used
@@ -42,8 +40,6 @@ main
 import numpy as np  # general mathematics and array handling
 from astropy.io import fits  # opening multiple HDU fits files
 from astropy.table import Table  # opening files as data tables
-# from astropy.modeling import models, fitting
-# import scipy.interpolate as sinterp  # for interpolation (we use linear)
 from scipy.optimize import curve_fit, OptimizeWarning
 import matplotlib.pyplot as plt
 from matplotlib import rc, rcParams
@@ -93,8 +89,6 @@ class OB:
         The programme ID
     resolution : str
         The resolution of this spectra
-    coordinate : int
-        The x coordinate (pixel - 1) of where the spectra is aligned on the slit
     ptobias : str
         The path to the bias files
     master_bias : numpy.ndarray
@@ -197,15 +191,14 @@ class OB:
         self.logger(f'Resolution {self.resolution}\nProgramme {self.prog}\nObserving block {self.ob}', w=True)
         if self.target_check():
             pbar = tqdm(total=100, desc=f'{self.resolution}/{self.prog}/{self.ob}')
-            self.figobj, self.axesobj = plt.subplots(4, 4, figsize=(16, 12), dpi=300)
+            self.figobj, self.axesobj = plt.subplots(4, 4, figsize=(16, 10), dpi=300)
             self.axesobj = self.axesobj.flatten()
-            self.figstd, self.axesstd = plt.subplots(4, 4, figsize=(16, 12), dpi=300)
+            self.figstd, self.axesstd = plt.subplots(4, 4, figsize=(16, 10), dpi=300)
+            self.figobjarc, self.axesobjarc = plt.subplots(figsize=(8, 5), dpi=300)
+            self.figstdarc, self.axesstdarc = plt.subplots(figsize=(8, 5), dpi=300)
             self.axesstd = self.axesstd.flatten()
-            self.coordinate = self.get_pixcoord()  # find pixel coordinate
-            pbar.update(3)
-            self.logger(f'Central pixel around {self.coordinate}')
             self.pixlow, self.pixhigh = self.pixel_constraints()
-            pbar.update(2)
+            pbar.update(5)
             self.logger(f'Use pixels from {self.pixlow} to {self.pixhigh}')
             self.ptobias = ptodata + '/bias/0*fits'  # path to biases
             self.logger(f'There are {len(glob.glob(self.ptobias))} bias files')
@@ -246,9 +239,9 @@ class OB:
             self.master_target, self.target, self.target_residual = self.object(self.ptoobj)  # reduces target
             pbar.update(30)
             self.logger(f'The target was {self.target}')
+            self.fig_formatter()  # formats the plots (titles, labels)
             self.writing('alt_redspec')  # writes reduced spectra to files
             pbar.update(5)
-            self.fig_formatter()  # formats the plots (titles, labels)
             pbar.update(5)
             pbar.close()
             print(f'Object processed: {self.target} for {self.resolution} '
@@ -294,22 +287,24 @@ class OB:
                 break
         return sname
 
-    def get_pixcoord(self) -> int:
+    @staticmethod
+    def get_pixcoord(data: np.ndarray) -> int:
         """Gets the pixel coordinate
 
         The row pixel where the spectra is should be recorded in the listed file (3 columns, programme ID,
         observation block, and pixel coordinate.
         """
         # the table referenced in the doc string
-        t = Table.read('observing_qc_positions_parseable.txt', format='ascii.no_header', names=('prog', 'ob', 'pix'))
-        coord = 250  # default coordinate pixel
-        for row in t:
-            if row['prog'] == self.prog and row['ob'] == self.ob:  # if the row programme ID and observation block match
-                coord = row['pix']  # use that pixel
-                break
-        if self.resolution == 'R2500I':  # if the resolution is R2500I
-            coord += 15  # there is spatial displacement worth 15 pixels
-        return coord - 1  # pixel to index conversion
+        # t = Table.read('observing_qc_positions_parseable.txt', format='ascii.no_header', names=('prog', 'ob', 'pix'))
+        # coord = 250  # default coordinate pixel
+        # for row in t:
+        #     if row['prog'] == prog and row['ob'] == ob:  # if the row programme ID and observation block match
+        #         coord = row['pix']  # use that pixel
+        #         break
+        # if res == 'R2500I':  # if the resolution is R2500I
+        #     coord += 15  # there is spatial displacement worth 15 pixels
+        coord = np.nanmedian(np.argmax(data, axis=-1)).astype(int)
+        return coord  # pixel to index conversion
 
     def pixel_constraints(self) -> Tuple[int, int]:
         """Finds the constraints for the respective resolution
@@ -476,6 +471,12 @@ class OB:
 
         arcs = {}
         arcfiles = glob.glob(ptoarcs)
+        if self.haveaperture:
+            ax = self.axesobj[12]
+            ax2 = self.axesobjarc
+        else:
+            ax = self.axesstd[12]
+            ax2 = self.axesstdarc
         try:
             if not len(arcfiles):
                 raise FileNotFoundError(f'{self.resolution} {self.prog} {self.ob} no arcs')
@@ -506,11 +507,15 @@ class OB:
             for line, arcgrp in dfarc.groupby('line'):
                 fitpixels[line] = []
                 for pix in arcgrp.pixel:
+                    ax.axvline(pix, color='black', ls='--')
+                    ax2.axvline(pix, color='black', ls='--')
                     minpix, maxpix = pix - 10, pix + 11
                     fitpixels[line].append((minpix, maxpix, pix))
                 fitpixels[line] = fitpixels[line]
             gfit_arr = []
             for lamp in arcs.keys():
+                ax.plot(np.arange(0, len(arcs[lamp])) + 1 + self.pixlow, arcs[lamp], color='blue')
+                ax2.plot(np.arange(0, len(arcs[lamp])) + 1 + self.pixlow, arcs[lamp], color='blue')
                 lampfit = []
                 for line in fitpixels.keys():
                     lsplit = line.split('I')[0]
@@ -532,13 +537,19 @@ class OB:
                     region = np.subtract(region, minreg)
                     amp = np.max(region[len(region) // 2 - 2: len(region) // 2 + 3])
                     xsmall = np.arange(int(minpix), int(maxpix))
+                    xbig = np.linspace(int(minpix), int(maxpix), len(xsmall) * 10, endpoint=False)
+                    regbig = np.interp(xbig, xsmall, region)
                     try:
-                        gfit = curve_fit(self.gaussian, xsmall, region, p0=[amp, pix, 2],
+                        gfit = curve_fit(self.gaussian, xbig, regbig, p0=[amp, pix, 2],
                                          bounds=([0, pix - 2, 0.5], [1.2 * amp, pix + 2, 2]))[0]
                     except ValueError as e:
                         raise ValueError(f'{e} {len(xsmall)} {minpix} {maxpix} {len(region)}')
                     except RuntimeError:
-                        gfit = [None, pix, None]
+                        self.logger('Runtime Error in arc fitting; check plot')
+                        gfit = [amp, pix, 2]
+                    bigreg = self.gaussian(xbig, *gfit) + minreg
+                    ax.plot(xbig + 1 + self.pixlow, bigreg, color='orange')
+                    ax2.plot(xbig + 1 + self.pixlow, bigreg, color='orange')
                     gfit = gfit[1] + 1 + self.pixlow
                     gfit_arr.append(gfit)
             arcpix = np.sort(gfit_arr)
@@ -727,12 +738,12 @@ class OB:
         region = np.abs(np.subtract(backsub, minreg)).astype(float)
         xsmall = np.arange(len(region), dtype=float)
         xbig = np.linspace(0, len(region), 1000, endpoint=False, dtype=float)
-        amp = np.nanmax(region[minind: maxind])
+        amp = np.nanmax(region[minind: maxind]).astype(float)
         thisdict['xsmall'] = xsmall.tolist()
         thisdict['xbig'] = xbig.tolist()
         yvals = np.interp(xbig, xsmall, region)
-        thisdict['region'] = segment.tolist()
-        thisdict['ybig'] = (yvals + backmode + minreg).tolist()
+        thisdict['region'] = segment.astype(float).tolist()
+        thisdict['ybig'] = (yvals + backmode + minreg).astype(float).tolist()
         p0 = [amp, cpix, 2]
         try:
             gfit = curve_fit(self.gaussian, xbig, yvals, p0=p0,
@@ -747,12 +758,25 @@ class OB:
         bigcpix = cpix = gfit[1]
         bigcpix_mhwhm = bigcpix - 0.75 * hwhm
         bigcpix_phwhm = bigcpix + 0.75 * hwhm
-        cpix_mhwhm = np.flatnonzero(xsmall > bigcpix_mhwhm)[0]
-        cpix_phwhm = np.flatnonzero(xsmall > bigcpix_phwhm)[0]
-        bpix_lowind = np.flatnonzero(xbig > bigcpix_mhwhm)[0]
-        bpix_highind = np.flatnonzero(xbig > bigcpix_phwhm)[0]
-        thisdict['yfit'] = (yvals + backmode + minreg).tolist()
-        thisdict['params'] = [bigcpix_mhwhm, bigcpix, bigcpix_phwhm, amp, minreg, backmode]
+        try:
+            cpix_mhwhm = np.flatnonzero(xsmall > bigcpix_mhwhm)[0]
+        except IndexError:
+            cpix_mhwhm = 0
+        try:
+            cpix_phwhm = np.flatnonzero(xsmall > bigcpix_phwhm)[0]
+        except IndexError:
+            cpix_phwhm = len(xsmall)
+        try:
+            bpix_lowind = np.flatnonzero(xbig > bigcpix_mhwhm)[0]
+        except IndexError:
+            bpix_lowind = 0
+        try:
+            bpix_highind = np.flatnonzero(xbig > bigcpix_phwhm)[0]
+        except IndexError:
+            bpix_highind = len(xbig)
+        thisdict['yfit'] = (yvals + backmode + minreg).astype(float).tolist()
+        thisdict['params'] = [float(bigcpix_mhwhm), float(bigcpix), float(bigcpix_phwhm),
+                              float(amp), float(minreg), float(backmode)]
         signal = np.trapz(yvals[bpix_lowind: bpix_highind] + minreg)
         return signal, cpix_mhwhm, cpix, cpix_phwhm, backmode, jdict
 
@@ -789,8 +813,10 @@ class OB:
         rightwidth = maxind - cpix if maxind - cpix > 1 else 1
         return leftwidth, rightwidth
 
-    def extract(self, data: np.ndarray, jdict: dict) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray,
-                                                              np.ndarray, np.ndarray, np.ndarray, dict]:
+    def extract(self, data: np.ndarray, jdict: dict, coord: int) -> Tuple[np.ndarray, np.ndarray,
+                                                                          np.ndarray, np.ndarray,
+                                                                          np.ndarray, np.ndarray,
+                                                                          np.ndarray, dict]:
         """Extracts the spectrum
 
         Take a 50 pixel slice around the central pixel with a sub-section of rows selected from the CCD based on the
@@ -803,17 +829,11 @@ class OB:
             The full CCD of the observation, to be sliced and extracted from
         jdict : dict
             Dictionary of extraction results
+        coord: int
+            Central pixel
         """
-        if self.resolution == 'R2500I':
-            data = data[self.pixlow:self.pixhigh, self.coordinate - 50:self.coordinate + 51]  # slicing spectra out
-            # pixels = np.arange(1, len(data) + 1)
-            # dline = data[625].flatten()
-            # N.B. 'pixels' are used throughout but the pixel - 1 = python index has been done
-        else:
-            data = data[self.pixlow:self.pixhigh, self.coordinate - 50:self.coordinate + 51]  # slicing spectra
-            # dline = data[1175 - self.pixlow].flatten()
-        pixels = np.arange(self.pixlow, self.pixhigh)
-        # lw, rw = self.aperture_width(dline)
+        data = data[self.pixlow:self.pixhigh, coord - 50:coord + 51]  # slicing spectra
+        pixels = np.arange(self.pixlow, self.pixhigh) + 1
         peaks, aptleft, aptcent, aptright, background = np.empty_like(pixels), np.empty_like(pixels), \
             np.empty_like(pixels), np.empty_like(pixels), np.empty_like(pixels)
         for i, row in enumerate(data):
@@ -907,12 +927,6 @@ class OB:
         """
         vegwave, vegflux = np.loadtxt(f'calib_models/{whichstd}_mod.txt', unpack=True)  # load the model
         vegerr = np.ones_like(vegwave) * (np.std(vegflux) / len(vegflux))  # determine the error
-        # fluxfunction = sinterp.interp1d(vegwave, vegflux)  # linearly interpolate wavelength to flux
-        # errfunction = sinterp.interp1d(vegwave, vegerr)  # linearly interpolate wavelength to flux error
-        # wave, flux, error = self.confining_region(wave, flux, error, vegwave)  # constrain observation to the model
-        # vegfluxpre, vegerrpre = vegflux.copy(), vegerr.copy()
-        # vegflux = fluxfunction(wave)  # find the model fluxes from the interpolation at observation resolution
-        # vegerr = errfunction(wave)  # find the model errors from the interpolation at observation resolution
         vegflux = np.interp(wave, vegwave, vegflux)
         vegerr = np.interp(wave, vegwave, vegerr)
         vegwave = np.interp(wave, vegwave, vegwave)
@@ -972,6 +986,8 @@ class OB:
         self.axesstd[0].set_title(f'Median Stack ({len(all_standards)} standard/s)')
         all_standards = np.stack([self.bisub(bias, std) for std in all_standards])
         median_standard = self.med_stack(all_standards)  # median stack the bias subtracted standards
+        stdcoord = self.get_pixcoord(median_standard)
+        self.logger(f'Central pixel for standard around {stdcoord + 1}')
         self.axesstd[1].imshow(median_standard, cmap='coolwarm', norm=imgnorm, origin='lower', aspect='auto')
         flat_standard = self.flat_field(flat, median_standard)  # flat field the standard
         self.axesstd[2].imshow(flat_standard, cmap='coolwarm', norm=imgnorm, origin='lower', aspect='auto')
@@ -981,18 +997,18 @@ class OB:
             json.dump({}, jfile)
         with open(f'alt_redspec/jsons/{obsblock}_{res}_{prog}_{sname}.json', 'r') as jfile:
             jdict = json.load(jfile)
-        pixel, photons, resid, aptleft, aptcent, aptright, back, jdict = self.extract(fixed_standard, jdict)
+        pixel, photons, resid, aptleft, aptcent, aptright, back, jdict = self.extract(fixed_standard, jdict, stdcoord)
         with open(f'alt_redspec/jsons/{obsblock}_{res}_{prog}_{sname}.json', 'w') as jfile:
             json.dump(jdict, jfile)
         outcpix = aptcent
         aptleftdiff = aptcent - aptleft
         aptrightdiff = aptright - aptcent
-        aptcent = aptcent - 50 + self.coordinate
+        aptcent = aptcent - 50 + stdcoord + 1
         aptleft = aptcent - aptleftdiff
         aptright = aptcent + aptrightdiff
         reducplot = self.axesstd[7].imshow(resid, cmap='coolwarm', norm=imgnorm, origin='lower', aspect='auto',
                                            extent=(
-                                           self.coordinate - 25, self.coordinate + 26, self.pixlow, self.pixhigh))
+                                           stdcoord - 25, stdcoord + 26, self.pixlow, self.pixhigh))
         plt.colorbar(reducplot, ax=self.axesstd[7])
         self.axesstd[7].plot(aptleft, pixel, color='black', lw=1, ls='--')
         self.axesstd[7].plot(aptright, pixel, color='black', lw=1, ls='--')
@@ -1004,7 +1020,7 @@ class OB:
         self.logger(f'The standard has {len(glob.glob(ptobest_arcs))} arc files')
         wave, arcpix, arcwave = self.transform(pixel, aptcent, ptobest_arcs)  # transform pixels to wavelength
         self.axesstd[9].errorbar(wave, photons, yerr=error)
-        self.axesstd[12].plot(arcpix, arcwave, color='red')
+        # self.axesstd[12].plot(arcpix, arcwave, color='red')
         wave, photons, error, ftoabs, ftoabs_error, \
         vegwave, vegflux, vegerr = self.vector_func(sname, wave, photons, error)  # vector constant
         self.axesstd[10].errorbar(wave, photons, yerr=error)
@@ -1121,6 +1137,8 @@ class OB:
         tname = self.get_header_info(object_list[-1])[0]
         all_objects = np.stack([self.fopener(obj) for obj in object_list])
         median_object = self.med_stack(all_objects)  # median stack objects
+        coordinate = self.get_pixcoord(median_object)  # find pixel coordinate
+        self.logger(f'Central pixel for object around {coordinate + 1}')
         self.axesobj[0].imshow(median_object, cmap='coolwarm', norm=imgnorm, origin='lower', aspect='auto')
         self.axesobj[0].set_title(f'Median Stack ({len(all_objects)} object/s)')
         all_objects = np.stack([self.bisub(self.master_bias, obj) for obj in all_objects])
@@ -1134,16 +1152,17 @@ class OB:
             json.dump({}, jfile)
         with open(f'alt_redspec/jsons/{self.ob}_{self.resolution}_{self.prog}_{tname}.json', 'r') as jfile:
             jdict = json.load(jfile)
-        pixel, photons, resid, aptleft, aptcent, aptright, back, jdict = self.extract(fixed_object, jdict)
+        pixel, photons, resid,\
+        aptleft, aptcent, aptright, back, jdict = self.extract(fixed_object, jdict, coordinate)
         with open(f'alt_redspec/jsons/{self.ob}_{self.resolution}_{self.prog}_{tname}.json', 'w') as jfile:
             json.dump(jdict, jfile)
         reducplot = self.axesobj[7].imshow(resid, cmap='coolwarm', norm=imgnorm, origin='lower', aspect='auto',
                                            extent=(
-                                           self.coordinate - 25, self.coordinate + 26, self.pixlow, self.pixhigh))
+                                           coordinate - 25, coordinate + 26, self.pixlow, self.pixhigh))
         plt.colorbar(reducplot, ax=self.axesobj[7])
         aptleftdiff = aptcent - aptleft
         aptrightdiff = aptright - aptcent
-        aptcent = aptcent - 50 + self.coordinate
+        aptcent = aptcent - 50 + coordinate + 1
         aptleft = aptcent - aptleftdiff
         aptright = aptcent + aptrightdiff
         self.axesobj[7].plot(aptleft, pixel, color='black', lw=1, ls='--')
@@ -1154,7 +1173,7 @@ class OB:
         self.axesobj[8].plot(pixel, back, color='orange')
         wave, arcpix, arcwave = self.transform(pixel, aptcent, self.ptoarcs)  # transform pixels to wavelength
         self.axesobj[9].errorbar(wave, photons, yerr=error)
-        self.axesobj[12].plot(arcpix, arcwave, color='red')
+        # self.axesobj[12].plot(arcpix, arcwave, color='red')
         wave, flux, error, tname = self.calibrate_real(wave, photons, error, tname,
                                                        self.ftoabs, self.ftoabs_error)  # real units spectra
         self.axesobj[10].errorbar(wave, flux, yerr=error)
@@ -1224,8 +1243,6 @@ class OB:
                 ax.set_yscale('log')
             axes[9].set_yscale('linear')
             axes[9].set_xlabel(r'$\lambda\ [\AA]$')
-            axes[12].set_xlabel('Y Pixel [pixel]')
-            axes[12].set_ylabel(r'$\lambda\ [\AA]$')
         self.axesobj[10].set_title('Final')
         self.axesobj[10].set_xlabel(r'$\lambda\ [\AA]$')
         self.axesobj[10].set_ylabel(r'$F_{\lambda}\ [\mathrm{erg}\ \mathrm{cm}^{-1}\ s^{-1}\ \AA^{-1}]$')
@@ -1233,6 +1250,10 @@ class OB:
         self.axesstd[10].set_xlabel(r'$\lambda\ [\AA]$')
         self.axesstd[10].set_ylabel('Counts')
         self.axesstd[10].set_yscale('linear')
+        for ax in (self.axesstdarc, self.axesstd[12], self.axesobjarc, self.axesobjarc):
+            ax.set_xlabel('Dispersion Axis [pixel]')
+            ax.set_ylabel('Counts')
+            ax.set_ylim(0, 65535)
         self.axesobj[13].set_title('Calibration Function')
         self.axesobj[13].set_xlabel(r'$\lambda\ [\AA]$')
         self.axesobj[13].set_ylabel(r'$\mathrm{Counts}\ F_{\lambda}^{-1}\ [\mathrm{erg}^{-1}\ \mathrm{cm}\ s\ \AA]$')
@@ -1248,15 +1269,17 @@ class OB:
         self.axesstd[14].set_ylabel(r'$\mathrm{Counts}\ F_{\lambda}^{-1}\ [\mathrm{erg}^{-1}\ \mathrm{cm}\ s\ \AA]$')
         [self.figobj.delaxes(self.axesobj[i]) for i in [11, 14, 15]]
         [self.figstd.delaxes(self.axesstd[i]) for i in [15, ]]
-        # self.figobj.suptitle(f'{self.target} using {self.standard_name} from'
-        #                      f' {self.stdobs} {self.stdres} {self.stdprog}')
         for fig in (self.figobj, self.figstd):
             fig.tight_layout(pad=1.5)
-        self.figobj.savefig(f'alt_redspec/reduction/{self.ob}_{self.resolution}_{self.prog}_{self.target}.png',
-                            bbox_inches='tight')
-        self.figstd.savefig(f'alt_redspec/reduction/{self.stdobs}_{self.stdres}_{self.stdprog}'
-                            f'_{self.standard_name}_for_{self.target}.png',
-                            bbox_inches='tight')
+        objfname = f'{self.ob}_{self.resolution}_{self.prog}_{self.target}.png'
+        stdfname = f'{self.stdobs}_{self.stdres}_{self.stdprog}_{self.standard_name}_for_{self.target}.png'
+        for fname in (objfname, stdfname):
+            fnameback = fname[:fname.find('.png')] + '.bak.png'
+            os.rename(f'alt_redspec/reduction/{fname}', f'alt_redspec/reduction/{fnameback}')
+        self.figobj.savefig(f'alt_redspec/reduction/{objfname}', bbox_inches='tight')
+        self.figstd.savefig(f'alt_redspec/reduction/{stdfname}', bbox_inches='tight')
+        self.figobjarc.savefig(f'alt_redspec/arcs/{objfname}', bbox_inches='tight')
+        self.figstdarc.savefig(f'alt_redspec/arcs/{stdfname}', bbox_inches='tight')
         return
 
     def logger(self, s: str, w: bool = False):
@@ -1421,12 +1444,12 @@ def main():
                     break
             else:
                 done_list = np.append(done_list, True)
-    # ob_list = ob_list[done_list]
+    ob_list = ob_list[done_list]
     ob_list = np.array(['Raw/R2500I/GTC54-15A0/OB0055'])
 
     # thread the unreduced files
     if len(ob_list):
-        avail_cores = 3 or 1  # available cores to thread over
+        avail_cores = 4 or 1  # available cores to thread over
         if len(ob_list) < avail_cores:
             avail_cores = len(ob_list)
         print(f'Threading over {avail_cores} cores.')
