@@ -925,7 +925,9 @@ class OB:
         error : np.ndarray
             A 1D array of errors on the WD standard counts
         """
-        vegwave, vegflux = np.loadtxt(f'calib_models/{whichstd}_mod.txt', unpack=True)  # load the model
+        vegwave, vegflux = np.loadtxt(f'calib_models/{whichstd}_mod.txt', unpack=True, usecols=(0, 1))  # load the model
+        # wave, f_lambda, f_nu are the columns
+        self.logger(f'Final wavelength of model is {vegwave.max()}A')
         vegerr = np.ones_like(vegwave) * (np.std(vegflux) / len(vegflux))  # determine the error
         vegflux = np.interp(wave, vegwave, vegflux)
         vegerr = np.interp(wave, vegwave, vegerr)
@@ -958,8 +960,9 @@ class OB:
         the dispersion axis with pixels converted to wavelength. Using the model, a calibration function of counts
         to absolute flux (at the Earth) is determined.
         """
-        best_std = self.closest_standard().split('_')
-        res, prog, obsblock = best_std[2], best_std[1], best_std[0]
+        # best_std = self.closest_standard().split('_')
+        # res, prog, obsblock = best_std[2], best_std[1], best_std[0]
+        res, prog, obsblock = self.resolution, self.prog, self.ob
         self.logger(f'Resolution of standard used {res}')
         self.logger(f'Programme of standard used {prog}')
         self.logger(f'Observing block of standard used {obsblock}')
@@ -1275,7 +1278,10 @@ class OB:
         stdfname = f'{self.stdobs}_{self.stdres}_{self.stdprog}_{self.standard_name}_for_{self.target}.png'
         for fname in (objfname, stdfname):
             fnameback = fname[:fname.find('.png')] + '.bak.png'
-            os.rename(f'alt_redspec/reduction/{fname}', f'alt_redspec/reduction/{fnameback}')
+            try:
+                os.rename(f'alt_redspec/reduction/{fname}', f'alt_redspec/reduction/{fnameback}')
+            except (FileNotFoundError, OSError):
+                pass  # if it's not there already, whatever
         self.figobj.savefig(f'alt_redspec/reduction/{objfname}', bbox_inches='tight')
         self.figstd.savefig(f'alt_redspec/reduction/{stdfname}', bbox_inches='tight')
         self.figobjarc.savefig(f'alt_redspec/arcs/{objfname}', bbox_inches='tight')
