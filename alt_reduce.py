@@ -507,15 +507,15 @@ class OB:
             for line, arcgrp in dfarc.groupby('line'):
                 fitpixels[line] = []
                 for pix in arcgrp.pixel:
-                    ax.axvline(pix, color='black', ls='--')
-                    ax2.axvline(pix, color='black', ls='--')
+                    # ax.axvline(pix, color='black', ls='--')
+                    # ax2.axvline(pix, color='black', ls='--')
                     minpix, maxpix = pix - 10, pix + 11
                     fitpixels[line].append((minpix, maxpix, pix))
                 fitpixels[line] = fitpixels[line]
             gfit_arr = []
             for lamp in arcs.keys():
-                ax.plot(np.arange(0, len(arcs[lamp])) + 1 + self.pixlow, arcs[lamp], color='blue')
-                ax2.plot(np.arange(0, len(arcs[lamp])) + 1 + self.pixlow, arcs[lamp], color='blue')
+                # ax.plot(np.arange(0, len(arcs[lamp])) + 1 + self.pixlow, arcs[lamp], color='blue')
+                # ax2.plot(np.arange(0, len(arcs[lamp])) + 1 + self.pixlow, arcs[lamp], color='blue')
                 lampfit = []
                 for line in fitpixels.keys():
                     lsplit = line.split('I')[0]
@@ -537,7 +537,7 @@ class OB:
                     region = np.subtract(region, minreg)
                     amp = np.max(region[len(region) // 2 - 2: len(region) // 2 + 3])
                     xsmall = np.arange(int(minpix), int(maxpix))
-                    xbig = np.linspace(int(minpix), int(maxpix), len(xsmall) * 10, endpoint=False)
+                    xbig = np.linspace(int(minpix), int(maxpix), len(xsmall) * 100, endpoint=False)
                     regbig = np.interp(xbig, xsmall, region)
                     try:
                         gfit = curve_fit(self.gaussian, xbig, regbig, p0=[amp, pix, 2],
@@ -548,16 +548,19 @@ class OB:
                         self.logger('Runtime Error in arc fitting; check plot')
                         gfit = [amp, pix, 2]
                     bigreg = self.gaussian(xbig, *gfit) + minreg
-                    ax.plot(xbig + 1 + self.pixlow, bigreg, color='orange')
-                    ax2.plot(xbig + 1 + self.pixlow, bigreg, color='orange')
+                    # ax.plot(xbig + 1 + self.pixlow, bigreg, color='orange')
+                    # ax2.plot(xbig + 1 + self.pixlow, bigreg, color='orange')
                     gfit = gfit[1] + 1 + self.pixlow
                     gfit_arr.append(gfit)
             arcpix = np.sort(gfit_arr)
             shifts = arcpix - dfarc.pixel.values
             self.logger(f'Pixels differ from master arc between {np.min(shifts):.2f} and {np.max(shifts):.2f} pixels')
             arcwav = dfarc.wave.values
+            ax.scatter(arcwav, shifts)
+            ax2.scatter(arcwav, shifts)
         co_eff = np.polyfit(arcpix, arcwav, 3)  # the coefficients of the polynomial from pixel to wavelength
         f = np.poly1d(co_eff)  # the fit to those coefficients
+        np.savetxt('temp_cpix_vals.txt', arcpix)
         return f(pixel), arcpix, arcwav  # wavelengths
 
     @staticmethod
@@ -1254,9 +1257,9 @@ class OB:
         self.axesstd[10].set_ylabel('Counts')
         self.axesstd[10].set_yscale('linear')
         for ax in (self.axesstdarc, self.axesstd[12], self.axesobjarc, self.axesobjarc):
-            ax.set_xlabel('Dispersion Axis [pixel]')
-            ax.set_ylabel('Counts')
-            ax.set_ylim(0, 65535)
+            ax.set_xlabel(r'$\lambda\ [\AA]$')
+            ax.set_ylabel('Pixel Shifts from Master')
+            # ax.set_ylim(0, 65535)
         self.axesobj[13].set_title('Calibration Function')
         self.axesobj[13].set_xlabel(r'$\lambda\ [\AA]$')
         self.axesobj[13].set_ylabel(r'$\mathrm{Counts}\ F_{\lambda}^{-1}\ [\mathrm{erg}^{-1}\ \mathrm{cm}\ s\ \AA]$')
