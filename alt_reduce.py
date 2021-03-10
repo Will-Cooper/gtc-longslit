@@ -12,15 +12,8 @@ It will search for spectra in the current directory sub-folder 'Raw/' in which w
 'bias/', 'flat/', 'object/' and 'stds/' inside which are the fits files beginning with '0'.
 
 Required non script files/ folders in the same directory as this script include:
-    * Master_info_correct_cm.csv    -- Containing the filenames, programme IDs, observing blocks, resolutions,
-                                       shortnames, distances, spectral type and spectral type number.
-    * calib_models/     -- Containing the WD models that correspond with the observed standards
-    * alt_done.log      -- An empty text file to be filled with the files that have been reduced already
-    * good_wds.txt      -- A descriptive file of which standards per observing block should be used
-    * BPM_(resolution)_python.txt       -- A file for the bad pixel masks for the resolution (else one will be made)
-    * alt_doplot.log    -- A descriptive file for which spectra should be plotted per observing block
-    * (resolution)_arcmap.txt       -- A file of pixel and wavelength
-    * R300R_correction_function.txt     -- Correcting second order contamination in R300R spectra
+    * .config  -- file containing config arguments
+    * BPM_(resolution)_python.txt       -- A file for the bad pixel masks for the resolution (else on
 
 Classes
 -------
@@ -31,16 +24,16 @@ BPM : str
 
 Methods
 -------
-repeat_check
-    Checks if an object has been observed in multiple observing blocks and median stacks if so
 main
     Main function of the script to make bad pixel mask and reduce the spectra
 """
-# TODO: Convert the above described requirements into something more soft coded that a user can provide.
+# TODO: Update some of the documentation
 import numpy as np  # general mathematics and array handling
-from astropy.io import fits  # opening multiple HDU fits files
+from numpy.polynomial.polynomial import Polynomial as Poly
+from astropy.io.fits import getdata, getheader
 from astropy.table import Table  # opening files as data tables
 from scipy.optimize import curve_fit, OptimizeWarning
+from scipy.interpolate import UnivariateSpline as Spline3
 import matplotlib.pyplot as plt
 from matplotlib import rc, rcParams
 from matplotlib.colors import LinearSegmentedColormap, LogNorm
@@ -50,10 +43,9 @@ from tqdm import tqdm
 import argparse
 import glob  # equivalent to linux 'ls'
 import warnings  # used for suppressing an annoying warning message about runtime
-import sys  # system arguments
 import multiprocessing  # used to overcome the inherent python GIL
 import time  # timing processing
-from typing import Tuple  # used for type hinting
+from typing import Tuple, Sequence  # used for type hinting
 import os
 import json
 
@@ -115,8 +107,6 @@ class OB:
         The standard actually used for the calibration (not neccesarily the standard of the observing block)
     standard_residual : numpy.ndarray
         The cut out region of the CCD around the spectra
-    actual_standard : str
-        The actual standard from the same observing block
     master_target : numpy.ndarray
         Wavelength, flux and flux error in absolute units of the target
     target : str
@@ -146,15 +136,10 @@ class OB:
         Normalised the flat field on the median of a select region (nominally around where the spectra tends to be)
     flat()
         Creates the flat field used for the reduction
-    transform(pixel)
-        Converts pixel values to wavelength after fitting a polynomial to the arc map
     checkifspectra(spectral_list)
         Ascertains that the spectra fits file is not an acquisition (they are in the same directory)
-    flat_field(data)
+    flat_field(data, flat)
         Divides the spectral CCD by the flat field
-    inf_fix(data)
-        Effectively performs the bad pixel masking of the spectra CCD (during flat fielding division where bad pixels
-        are 0, numpy provides an infinite value, this function resets them to be 0)
     back_subtract(data, back)
         Using a CCD row, subtracts the background of that row from the actual signals
     peak_average(segment)
@@ -190,6 +175,7 @@ class OB:
         self.resolution = ptodata.split('/')[1]  # resolution of this spectra
         self.logger(f'Resolution {self.resolution}\nProgramme {self.prog}\nObserving block {self.ob}', w=True)
         if self.target_check():
+            # initialising
             pbar = tqdm(total=100, desc=f'{self.resolution}/{self.prog}/{self.ob}')
             self.figobj, self.axesobj = plt.subplots(4, 4, figsize=(16, 10), dpi=300)
             self.axesobj = self.axesobj.flatten()
@@ -197,25 +183,30 @@ class OB:
             self.figobjarc, self.axesobjarc = plt.subplots(figsize=(8, 5), dpi=300)
             self.figstdarc, self.axesstdarc = plt.subplots(figsize=(8, 5), dpi=300)
             self.axesstd = self.axesstd.flatten()
+            # pixel limits
             self.pixlow, self.pixhigh = self.pixel_constraints()
             pbar.update(5)
             self.logger(f'Use pixels from {self.pixlow} to {self.pixhigh}')
+            # bias
             self.ptobias = ptodata + '/bias/0*fits'  # path to biases
             self.logger(f'There are {len(glob.glob(self.ptobias))} bias files')
             self.master_bias = self.bias(self.ptobias)  # creates the master bias file
             pbar.update(5)
             biasplot = self.axesobj[4].imshow(self.master_bias, cmap='BuPu', origin='lower', aspect='auto')
             plt.colorbar(biasplot, ax=self.axesobj[4])
+            # flat
             self.ptoflats = ptodata + '/flat/0*fits'  # path to flats
             self.logger(f'There are {len(glob.glob(self.ptoflats))} flats files')
             self.master_flat = self.flat(self.ptoflats, self.master_bias)  # creates the master flat file
             pbar.update(5)
             flatplot = self.axesobj[5].imshow(self.master_flat, cmap='BuPu', origin='lower', aspect='auto')
             plt.colorbar(flatplot, ax=self.axesobj[5])
+            # bad pixel mask
             self.bpm = self.bpm_applying(np.ones_like(self.master_flat))
             pbar.update(5)
             bpmplot = self.axesobj[6].imshow(self.bpm, cmap=ccd_bincmap, origin='lower', aspect='auto')
             plt.colorbar(bpmplot, ax=self.axesobj[6])
+            # header info and further initialisation
             self.ptoobj = ptodata + '/object/0*fits'  # path to object
             self.logger(f'There are {len(glob.glob(self.ptoobj))} object files')
             self.humidity, self.airmass, self.mjd = self.hum_air()  # average humidity and airmass of object obs
@@ -225,19 +216,19 @@ class OB:
             self.logger(f'There are {len(glob.glob(self.ptostds))} standards files')
             self.ptoarcs = ptodata + '/arc/0*fits'  # path to arcs
             self.logger(f'There are {len(glob.glob(self.ptoarcs))} arcs files')
+            # standard
             self.logger('The standard is being reduced and analysed:')
             self.haveaperture = False
             self.ftoabs, self.master_standard, self.ftoabs_error, self.standard_name, \
-            self.standard_residual, self.stdobs, \
-            self.stdres, self.stdprog,\
-            self.cpix, self.aptleft, self.aptright = self.standard()  # reduces the closest standard to target
+            self.standard_residual, self.cpix, self.aptleft, self.aptright = self.standard()  # standard reduction
             self.haveaperture = True
             pbar.update(35)
-            self.actual_standard = self.standard_name
             self.logger(f'Name of standard being used was {self.standard_name.upper()}')
+            # object
             self.logger('The object is now being reduced:')
-            self.master_target, self.target, self.target_residual = self.object(self.ptoobj)  # reduces target
+            self.master_target, self.target, self.target_residual = self.object()  # reduces target
             pbar.update(30)
+            # writing files and creating plots
             self.logger(f'The target was {self.target}')
             self.fig_formatter()  # formats the plots (titles, labels)
             self.writing('alt_redspec')  # writes reduced spectra to files
@@ -257,14 +248,18 @@ class OB:
         Opens up the table of sources and compares observing block, programme ID against this source,
         if the object is not in the table, don't waste time reducing it.
         """
-        tinfo = Table.read('Master_info_correct_cm.csv')  # table containing observation information
-        for row in tinfo:
-            if row['OB'].strip() == self.ob and row['Program'].strip() == self.prog \
-                    and row['Resolution'].strip() == self.resolution:
-                dosource = True
-                break
+        try:
+            tinfo = Table.read('Master_info_correct_cm.csv')  # table containing observation information
+        except (OSError, FileNotFoundError):
+            return True
         else:
-            dosource = False
+            for row in tinfo:
+                if row['OB'].strip() == self.ob and row['Program'].strip() == self.prog \
+                        and row['Resolution'].strip() == self.resolution:
+                    dosource = True
+                    break
+            else:
+                dosource = False
         return dosource
 
     @staticmethod
@@ -279,12 +274,16 @@ class OB:
         sname : str
             The name of the object to be compared with the table
         """
-        tinfo = Table.read('Master_info_correct_cm.csv')  # table containing header names and shortnames
         sname = sname.strip()  # remove whitespace
-        for row in tinfo:
-            if row['Target'].strip() == sname:  # if the header names match
-                sname = row['SHORTNAME']  # take the shortname as the target name
-                break
+        try:
+            tinfo = Table.read('Master_info_correct_cm.csv')  # table containing header names and shortnames
+        except (OSError, FileNotFoundError):
+            pass
+        else:
+            for row in tinfo:
+                if row['Target'].strip() == sname:  # if the header names match
+                    sname = row['SHORTNAME']  # take the shortname as the target name
+                    break
         return sname
 
     @staticmethod
@@ -294,33 +293,20 @@ class OB:
         The row pixel where the spectra is should be recorded in the listed file (3 columns, programme ID,
         observation block, and pixel coordinate.
         """
-        # the table referenced in the doc string
-        # t = Table.read('observing_qc_positions_parseable.txt', format='ascii.no_header', names=('prog', 'ob', 'pix'))
-        # coord = 250  # default coordinate pixel
-        # for row in t:
-        #     if row['prog'] == prog and row['ob'] == ob:  # if the row programme ID and observation block match
-        #         coord = row['pix']  # use that pixel
-        #         break
-        # if res == 'R2500I':  # if the resolution is R2500I
-        #     coord += 15  # there is spatial displacement worth 15 pixels
         coord = np.nanmedian(np.argmax(data, axis=-1)).astype(int)
         return coord  # pixel to index conversion
 
-    def pixel_constraints(self) -> Tuple[int, int]:
+    @staticmethod
+    def pixel_constraints() -> Tuple[int, int]:
         """Finds the constraints for the respective resolution
 
         Using the resolution of this object, find the limits on the dispersion axis at which to extract spectra
         """
-        if self.resolution == "R2500I":
-            xmin = 40
-            xmax = 1900
-        else:
-            xmin = 830
-            xmax = 1410
+        xmin, xmax = config.minpix, config.maxpix
         return xmin, xmax
 
     @staticmethod
-    def bisub(bias: np.ndarray, data: np.ndarray) -> np.ndarray:
+    def bisub(data: np.ndarray, bias: np.ndarray) -> np.ndarray:
         """Bias subtract from each ccd given
 
         Elementwise subtraction of the entire CCD, pixel by pixel
@@ -332,7 +318,7 @@ class OB:
         data : np.ndarray
             The full CCD that will have the bias subtracted
         """
-        return data - bias
+        return np.subtract(data, bias)
 
     def bpm_applying(self, data: np.ndarray) -> np.ndarray:
         """Applies the bad pixel mask
@@ -345,7 +331,7 @@ class OB:
             The full CCD that needs to be masked
         """
         mask = np.loadtxt(f'BPM_{self.resolution}_python.txt')
-        return mask * data  # BPM is array of 1=good, 0=bad
+        return np.multiply(mask, data)  # BPM is array of 1=good, 0=bad
 
     @staticmethod
     def fopener(fname: str) -> np.ndarray:
@@ -356,12 +342,12 @@ class OB:
         fname : str
             The relative or full string to the file to be opened
         """
-        with fits.open(fname) as hdul:
-            data = hdul[2].data  # OSIRIS longslit is targeted on the second CCD
+        data = getdata(fname, ext=2)
         return data
 
-    def fopenbisub(self, bias: np.ndarray, fname: str) -> np.ndarray:
-        """Uses the file opening method and bias subtracting method
+    def fopenbisub(self, fname: str, bias: np.ndarray) -> np.ndarray:
+        """
+        Uses the file opening method and bias subtracting method as all-in-one convenience function
 
         Parameters
         ----------
@@ -370,7 +356,8 @@ class OB:
         fname : str
             The relative or full string to the file to be opened
         """
-        return self.bisub(bias, self.fopener(fname))  # opens and then bias subtracts the file using the listed methods
+        unsubbed_arr = self.fopener(fname)
+        return self.bisub(unsubbed_arr, bias)  # opens and then bias subtracts the file using the listed methods
 
     @staticmethod
     def med_stack(all_data: np.ndarray) -> np.ndarray:
@@ -427,10 +414,13 @@ class OB:
         data : np.ndarray
             The full CCD of the median flat
         """
-        if self.resolution == 'R2500I':
-            dtrimmed = data[self.pixlow:self.pixhigh, 165:365]
-        else:
-            dtrimmed = data[self.pixlow:self.pixhigh, 150:350]
+        low = config.cpix - config.stripewidth - 1
+        high = config.cpix + config.stripewidth - 1
+        if low < 0:
+            low = 0
+        if high > data.shape[1]:
+            high = data.shape[1]
+        dtrimmed = data[self.pixlow: self.pixhigh, low: high]
         return data / np.median(dtrimmed)
 
     def flat(self, ptoflats: str, bias: np.ndarray) -> np.ndarray:
@@ -448,120 +438,154 @@ class OB:
             The full CCD of the bias file
         """
         flat_list = glob.glob(ptoflats)  # list of all flats in observing block
-        all_flats = np.stack([self.fopenbisub(bias, flat) for flat in flat_list])
+        all_flats = np.stack([self.fopenbisub(flat, bias) for flat in flat_list])
         median_flat = self.med_stack(all_flats)  # determines bias subtracted median flat
         bpm_flat = self.bpm_applying(median_flat)  # apply bad pixel mask
         return self.normalise(bpm_flat)  # normalised flat
 
-    def transform(self, pixel: np.ndarray, cpix: np.ndarray, ptoarcs: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Transform pixels into wavelength
-
-        Loads the given file from OSIRIS, extracts the pixel and wavelength then fits a 3rd order polynomial
-        and applies that to all the pixels given.
+    @staticmethod
+    def identify(pixel: np.ndarray, dataline: np.ndarray, lamp: str) -> pd.DataFrame:
+        """
+        Identifies the lines in an arc and compares to line list
 
         Parameters
         ----------
-        pixel : np.ndarray
-            1D array of pixel values along the dispersion axis
-        cpix : np.ndarray
-            1D array of which pixel the spectrum is
-        ptoarcs : str
-            The path to the arc files
-        """
+        pixel: np.ndarray
+            The 1D array of spectra pixels
+        dataline: np.ndarray
+            The 1D array of the arc to have lines identified in
+        lamp: str
+            The object keyword in the header for which lamp is being checked
 
-        arcs = {}
-        arcfiles = glob.glob(ptoarcs)
+        Returns
+        -------
+        pix_wave: pd.DataFrame
+            A dataframe of columns pixel to wavelength
+        """
+        linelist = pd.read_csv(f'lablinelist/{lamp}I.csv')
+        linelist = linelist[np.logical_and(linelist.wave > config.minwave, linelist.wave < config.maxwave)].copy()
+        linelist.sort_values('intens', ascending=False, inplace=True, ignore_index=True)  # sort down by intensity
+        xhigh = np.linspace(np.min(pixel), np.max(pixel), pixel.size * 100)
+        sp = Spline3(pixel, dataline)
+        spfit = sp(xhigh)
+        cpeak, wherepk, increasing = 0, np.empty(0), True
+        comp = np.mean(spfit) + np.std(spfit)
+        pntcomp = np.mean(spfit)
+        for i, pnt in enumerate(spfit):
+            i = xhigh[i]
+            if pnt > pntcomp:
+                increasing = True
+            else:
+                if pntcomp > comp and increasing:
+                    if not len(wherepk) or i - wherepk[-1] > 3:  # ignore blended
+                        wherepk = np.append(wherepk, i)
+                        cpeak += 1
+                increasing = False
+            pntcomp = pnt
+
+        linewaves = np.empty(0)
+        for i, row in linelist.iterrows():
+            if len(linewaves) == cpeak:
+                break
+            if not linewaves.size or np.all(np.abs(np.subtract(linewaves, row.wave)) > 5):  # ignore blended
+                linewaves = np.append(linewaves, row.wave)
+
+        pix_wave = pd.DataFrame({'pixel': wherepk, 'wave': np.sort(linewaves)})
+        return pix_wave
+
+    def solution_fitter(self, df: pd.DataFrame, ax: plt.Axes) -> Poly:
+        """
+        Iteratively fits to arc solution
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            The dataframe of pixel to wavelength
+        ax : plt.Axes
+            The plot axes to put the residuals on
+
+        Returns
+        -------
+        pcomb: Poly
+            The combined polynomial solution
+        """
+        linfit: Poly = Poly.fit(df.pixel.values, df.wave.values, deg=1)  # linear fit
+        residual = linfit(df.pixel.values) - df.wave.values
+        df = df[np.logical_and(np.abs(residual) < 100,
+                               np.logical_and(df.pixel > self.pixlow + 100,
+                                              df.pixel < self.pixhigh - 100))].copy()
+        linfit = Poly.fit(df.pixel.values, df.wave.values, deg=1)  # linear fit
+        residual = linfit(df.pixel.values) - df.wave.values
+        thirdorder: Poly = Poly.fit(df.pixel.values, residual, deg=3)
+        ax.plot(df.pixel, thirdorder(df.pixel.values), 'yx', label='Linear Residual 1')
+        ax.plot(*thirdorder.linspace(), 'y--', label='3rd Order Fit 1')
+        pcomb = linfit - thirdorder
+        residual = pcomb(df.pixel.values) - df.wave
+        ax.plot(df.pixel, residual, 'mx', label='Combined Residual 1')
+        iqr = np.subtract(*np.quantile(residual, [.75, .25]))
+        ax.fill_between(df.pixel.values, -2*iqr, 2*iqr, color='cyan', label='2X IQR 1', alpha=0.5)
+        df = df[np.logical_and(np.abs(residual) < 2 * iqr,
+                               np.logical_and(df.pixel > self.pixlow + 100,
+                                              df.pixel < self.pixhigh - 100))].copy()
+        residual = residual[np.abs(residual) < 2 * iqr]
+        weights = np.divide(1, np.power(residual, 3), where=residual != 0)
+        # do again from start, now with weights and some bad data removed
+        linfit = Poly.fit(df.pixel.values, df.wave.values, deg=1, w=weights)  # linear fit
+        residual = linfit(df.pixel.values) - df.wave.values
+        thirdorder = Poly.fit(df.pixel.values, residual, deg=3, w=weights)
+        ax.plot(df.pixel, thirdorder(df.pixel.values), 'rx', label='Linear Residual 2')
+        ax.plot(*thirdorder.linspace(), 'r--', label='3rd Order Fit 2')
+        pcomb = linfit - thirdorder
+        residual = pcomb(df.pixel.values) - df.wave
+        rmsd = np.sqrt(np.sum(np.square(residual)) / residual.size)
+        iqr = np.subtract(*np.quantile(residual, [.75, .25]))
+        ax.fill_between(df.pixel.values, -2 * iqr, 2 * iqr, color='blue', label='2X IQR 2', alpha=0.25)
+        rmsdiqr = rmsd / iqr
+        self.logger(f'Arc solution RMSDIQR {rmsdiqr}')
+        ax.plot(df.pixel, residual, 'bx', label='Combined Residual 2')
+        return pcomb
+
+    def arc_solution(self, pixel: np.ndarray, cpix: np.ndarray, ptoarcs: str) -> np.ndarray:
+        """
+        Generates the wavelength solution from the arcs
+
+        Parameters
+        ----------
+        pixel: np.ndarray
+            The array of pixels corresponding to the spectra
+        cpix: np.ndarray
+            The pixel where the centre of the extraction aperture lies
+        ptoarcs: str
+            The path to the directory holding the arc files
+
+        Returns
+        -------
+        wave: np.ndarray
+            The wavelengths converted from pixels via the wavelength solution
+        """
         if self.haveaperture:
             ax = self.axesobj[12]
             ax2 = self.axesobjarc
         else:
             ax = self.axesstd[12]
             ax2 = self.axesstdarc
-        try:
-            if not len(arcfiles):
-                raise FileNotFoundError(f'{self.resolution} {self.prog} {self.ob} no arcs')
-        except FileNotFoundError:
-            self.logger('Using master arc file as observing block has no arcs!')
-            dfarc = pd.read_csv(f'{self.resolution}_arcmap.csv')
-            dfarc = dfarc[dfarc.line != 'Null'].copy()
-            arcpix, arcwav = dfarc.pixel, dfarc.wave
-        else:
-            if cpix.dtype != 'int64':
-                cpix = cpix.astype(int)
-            for f in arcfiles:
-                with fits.open(f) as hdul:
-                    head = hdul[0].header
-                    data = hdul[2].data[self.pixlow: self.pixhigh]
-                datacut = np.empty(data.shape[0], dtype=int)
-                for i, row in enumerate(data):
-                    cpixmid = cpix[i]
-                    minrow = cpixmid - 2 if cpixmid - 2 >= 0 else 0
-                    maxrow = cpixmid + 3 if cpixmid + 3 <= len(row) else len(row)
-                    rowcut = row[minrow:maxrow]
-                    datacut[i] = np.nanmedian(rowcut)
-                lamp = head['OBJECT'].split('_')[-1]
-                arcs[lamp] = datacut
-            fitpixels = {}
-            dfarc = pd.read_csv(f'{self.resolution}_arcmap.csv')
-            dfarc = dfarc[dfarc.line != 'Null'].copy()
-            for line, arcgrp in dfarc.groupby('line'):
-                fitpixels[line] = []
-                for pix in arcgrp.pixel:
-                    # ax.axvline(pix, color='black', ls='--')
-                    # ax2.axvline(pix, color='black', ls='--')
-                    minpix, maxpix = pix - 10, pix + 11
-                    fitpixels[line].append((minpix, maxpix, pix))
-                fitpixels[line] = fitpixels[line]
-            gfit_arr = []
-            for lamp in arcs.keys():
-                # ax.plot(np.arange(0, len(arcs[lamp])) + 1 + self.pixlow, arcs[lamp], color='blue')
-                # ax2.plot(np.arange(0, len(arcs[lamp])) + 1 + self.pixlow, arcs[lamp], color='blue')
-                lampfit = []
-                for line in fitpixels.keys():
-                    lsplit = line.split('I')[0]
-                    if lsplit in lamp:
-                        fp_line = fitpixels[line]
-                        if lampfit is []:
-                            lampfit = fp_line
-                        else:
-                            lampfit.extend(fp_line)
-                lampfit = np.array(lampfit)
-                for fitparams in lampfit:
-                    minpix, maxpix, pix = fitparams - (1 + self.pixlow)
-                    if minpix < 0:
-                        minpix = 0
-                    if maxpix > (self.pixhigh - self.pixlow):
-                        maxpix = len(arcs[lamp])
-                    region = arcs[lamp][int(minpix): int(maxpix)]
-                    minreg = np.min(region)
-                    region = np.subtract(region, minreg)
-                    amp = np.max(region[len(region) // 2 - 2: len(region) // 2 + 3])
-                    xsmall = np.arange(int(minpix), int(maxpix))
-                    xbig = np.linspace(int(minpix), int(maxpix), len(xsmall) * 100, endpoint=False)
-                    regbig = np.interp(xbig, xsmall, region)
-                    try:
-                        gfit = curve_fit(self.gaussian, xbig, regbig, p0=[amp, pix, 2],
-                                         bounds=([0, pix - 2, 0.5], [1.2 * amp, pix + 2, 2]))[0]
-                    except ValueError as e:
-                        raise ValueError(f'{e} {len(xsmall)} {minpix} {maxpix} {len(region)}')
-                    except RuntimeError:
-                        self.logger('Runtime Error in arc fitting; check plot')
-                        gfit = [amp, pix, 2]
-                    bigreg = self.gaussian(xbig, *gfit) + minreg
-                    # ax.plot(xbig + 1 + self.pixlow, bigreg, color='orange')
-                    # ax2.plot(xbig + 1 + self.pixlow, bigreg, color='orange')
-                    gfit = gfit[1] + 1 + self.pixlow
-                    gfit_arr.append(gfit)
-            arcpix = np.sort(gfit_arr)
-            shifts = arcpix - dfarc.pixel.values
-            self.logger(f'Pixels differ from master arc between {np.min(shifts):.2f} and {np.max(shifts):.2f} pixels')
-            arcwav = dfarc.wave.values
-            ax.scatter(arcwav, shifts)
-            ax2.scatter(arcwav, shifts)
-        co_eff = np.polyfit(arcpix, arcwav, 3)  # the coefficients of the polynomial from pixel to wavelength
-        f = np.poly1d(co_eff)  # the fit to those coefficients
-        np.savetxt('temp_cpix_vals.txt', arcpix)
-        return f(pixel), arcpix, arcwav  # wavelengths
+        arcfiles = glob.glob(ptoarcs)
+        all_pix_wave = pd.DataFrame(columns=('pixel', 'wave'))
+        for i, arc in enumerate(arcfiles):
+            arcdata = getdata(arc, ext=2)  # extract whole arc
+            arcdata = np.subtract(arcdata, self.master_bias)  # bias subtract
+            arcdata = np.divide(arcdata, self.master_flat, where=self.master_flat != 0)  # flat field
+            arcdata = arcdata[self.pixlow: self.pixhigh]
+            arccut = arcdata[np.arange(len(arcdata)), cpix.astype(int)].flatten()  # just extraction pixel
+            lamp = getheader(arc, ext=0)['OBJECT'].split('_')[-1].lower()
+            pix_wave = self.identify(pixel, arccut, lamp)
+            all_pix_wave = all_pix_wave.append(pix_wave).reset_index(drop=True)
+        all_pix_wave.sort_values('pixel', inplace=True, ignore_index=True)
+        soln = self.solution_fitter(all_pix_wave, ax2)
+        wave = soln(pixel)
+        ax.plot(pixel, wave, 'k-')
+        ax.plot(all_pix_wave.pixel, all_pix_wave.wave, 'kx')
+        return wave
 
     @staticmethod
     def gaussian(_x: np.ndarray, _amp: float, cen: float, wid: float):
@@ -601,20 +625,17 @@ class OB:
         bo_arr = np.array([], dtype=bool)  # empty boolean array
         spectral_list = np.array(spectral_list)  # convert to numpy array
         for spectra in spectral_list:
-            with fits.open(spectra) as hdul:
-                head = hdul[0].header
-                if head['GRISM'] == 'OPEN':  # i.e. acquisiton
-                    bo_arr = np.append(bo_arr, False)
-                else:
-                    bo_arr = np.append(bo_arr, True)
+            head = getheader(spectra, ext=0)
+            if head['GRISM'] == 'OPEN':  # i.e. acquisiton
+                bo_arr = np.append(bo_arr, False)
+            else:
+                bo_arr = np.append(bo_arr, True)
         return spectral_list[bo_arr]  # only use files that are actual spectra
 
     @staticmethod
-    def flat_field(flat: np.ndarray, data: np.ndarray) -> np.ndarray:
-        """Apply the normalised flat field
-
-        Note that as the flat field has had a bad pixel mask over it, division by zero causes the output of this
-        method to contain infinite counts where the bad pixel is. Use inf_fix to remedy this.
+    def flat_field(data: np.ndarray, flat: np.ndarray) -> np.ndarray:
+        """
+        Apply the normalised flat field and act as bad pixel mask where the flat is 0
 
         Parameters
         ----------
@@ -623,22 +644,7 @@ class OB:
         data : np.ndarray
             The full CCD that will needs to be flat fielded
         """
-        return data / flat
-
-    @staticmethod
-    def inf_fix(data: np.ndarray) -> np.ndarray:
-        """Where there is a bad pixel, the data will now be infinite. This will set those to 0.
-
-        Parameters
-        ----------
-        data : np.ndarray
-            The flat fielded CCD which contains infinite values
-        """
-        temp = data.flatten()  # turns the 2D CCD into 1D
-        for i, val in enumerate(temp):
-            if np.isinf(val):  # if the value is infinite
-                temp[i] = 0  # set it to 0 (bad pixel)
-        return temp.reshape(data.shape)  # reshape back to 2D, but with bad pixels now 0 not infinite
+        return np.divide(data, flat, where=flat != 0)  # returns 0 on the bad pixel masks
 
     @staticmethod
     def back_subtract(data: float, back: float) -> float:
@@ -835,7 +841,8 @@ class OB:
         coord: int
             Central pixel
         """
-        data = data[self.pixlow:self.pixhigh, coord - 50:coord + 51]  # slicing spectra
+        data = data[self.pixlow:self.pixhigh,
+                    coord - config.stripewidth // 2: coord + 1 + config.stripewidth // 2]  # slicing spectra
         pixels = np.arange(self.pixlow, self.pixhigh) + 1
         peaks, aptleft, aptcent, aptright, background = np.empty_like(pixels), np.empty_like(pixels), \
             np.empty_like(pixels), np.empty_like(pixels), np.empty_like(pixels)
@@ -908,36 +915,58 @@ class OB:
         wave = wave[np.logical_and(wave >= np.min(wave_check), wave <= np.max(wave_check))]
         return wave, flux, error
 
+    def model_data(self, whichstd: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Gets the data from the relevant model
+
+        Parameters
+        ----------
+        whichstd: str
+            Name of the standard
+
+        Returns
+        -------
+        modwave: np.ndarray
+            The model wavelength
+        modflux: np.ndarray
+            The model flux
+        moderr: np.ndarray
+            The model flux errors
+        """
+        modwave, modflux = np.loadtxt(f'calib_models/{whichstd}_mod.txt', unpack=True, usecols=(0, 1))  # load model
+        # wave, f_lambda, f_nu are the columns
+        self.logger(f'Final wavelength of model is {modwave.max()}A')
+        moderr = np.ones_like(modwave) * (np.std(modflux) / len(modflux))  # determine the error
+        return modwave, modflux, moderr
+
     def vector_func(self, whichstd: str, wave: np.ndarray,
-                    flux: np.ndarray, error: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray,
+                    flux: np.ndarray, error: np.ndarray) -> Tuple[np.ndarray, np.ndarray,
+                                                                  np.ndarray, np.ndarray,
                                                                   np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Divides the standard by a model to get a vector constant
 
-        Loads the model that calibrates with the best WD standard for these objects, interpolates them down to
+        Loads the model that calibrates with the best standard for these objects, interpolates them down to
         the resolution of the standard spectra. Then finds the calibration function and propagates the error
         into that (error determined from the models).
 
         Parameters
         ----------
         whichstd : str
-            A string which is the name of the WD that has standard observations and a calibration model
+            A string which is the name of the that has standard observations and a calibration model
         wave : np.ndarray
-            A 1D array of wavelengths of the WD standard
+            A 1D array of wavelengths of the standard
         flux : np.ndarray
-            A 1D array of photon counts of the WD standard
+            A 1D array of photon counts of the standard
         error : np.ndarray
-            A 1D array of errors on the WD standard counts
+            A 1D array of errors on the standard counts
         """
-        vegwave, vegflux = np.loadtxt(f'calib_models/{whichstd}_mod.txt', unpack=True, usecols=(0, 1))  # load the model
-        # wave, f_lambda, f_nu are the columns
-        self.logger(f'Final wavelength of model is {vegwave.max()}A')
-        vegerr = np.ones_like(vegwave) * (np.std(vegflux) / len(vegflux))  # determine the error
-        vegflux = np.interp(wave, vegwave, vegflux)
-        vegerr = np.interp(wave, vegwave, vegerr)
-        vegwave = np.interp(wave, vegwave, vegwave)
-        ftoabs = flux / vegflux  # the calibration function as counts to absolute flux
-        comb_error = self.calibrate_errorprop(ftoabs, error, vegerr, vegflux)  # propagate the error into function
-        return wave, flux, error, ftoabs, comb_error, vegwave, vegflux, vegerr
+        modwave, modflux, moderr = self.model_data(whichstd)
+        modflux = np.interp(wave, modwave, modflux)
+        moderr = np.interp(wave, modwave, moderr)
+        modwave = np.interp(wave, modwave, modwave)
+        ftoabs = flux / modflux  # the calibration function as counts to absolute flux
+        comb_error = self.calibrate_errorprop(ftoabs, error, moderr, modflux)  # propagate the error into function
+        return wave, flux, error, ftoabs, comb_error, modwave, modflux, moderr
 
     @staticmethod
     def get_header_info(fname: str) -> Tuple[str, float, float, float]:
@@ -948,73 +977,88 @@ class OB:
         fname : str
             The UNIX path to the file being opened as a string
         """
-        with fits.open(fname) as hdul:
-            head = hdul[0].header  # the observational information on OSIRIS is on the first HDU
+        head = getheader(fname, ext=0)  # the observational information on OSIRIS is on the first HDU
         return head['OBJECT'].rstrip(), head['HUMIDITY'], head['AIRMASS'], head['MJD-OBS']
 
-    def standard(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, str, np.ndarray,
-                                str, str, str, np.ndarray, np.ndarray, np.ndarray]:
-        """Reduces standard and creates conversion to absolute units
-
-        This method finds the closest standards observation block to the observation in terms of airmass and humidity
-        before loading that observation block (note. that is not neccesarily the same observation block as the object).
-        The name of that WD standard is used to open the corresponding WD model. The observation is stacked on its
-        median, bias subtracted, bad pixel masked and flat fielded before the signal is extracted along
-        the dispersion axis with pixels converted to wavelength. Using the model, a calibration function of counts
-        to absolute flux (at the Earth) is determined.
+    def json_handler(self, objname: str, perm: str, jobj: dict = None):
         """
-        # best_std = self.closest_standard().split('_')
-        # res, prog, obsblock = best_std[2], best_std[1], best_std[0]
-        res, prog, obsblock = self.resolution, self.prog, self.ob
-        self.logger(f'Resolution of standard used {res}')
-        self.logger(f'Programme of standard used {prog}')
-        self.logger(f'Observing block of standard used {obsblock}')
-        ptobest_std = f'Raw/{res}/{prog}/{obsblock}/stds/0*scopy.fits'
-        self.logger(f'The standard has {len(glob.glob(ptobest_std))} standard files')
-        ptobest_bias = f'Raw/{res}/{prog}/{obsblock}/bias/0*.fits'
-        self.logger(f'The standard has {len(glob.glob(ptobest_bias))} bias files')
-        bias = self.bias(ptobest_bias)
-        biasplot = self.axesstd[4].imshow(bias, cmap='BuPu', origin='lower', aspect='auto')
+        Handles the creation and editing of json files (used for live plots)
+
+        Parameters
+        ----------
+        objname : str
+            Name of the object being handled
+        perm : str
+            Permissions to open json with
+        jobj : dict
+            Object to dump into json if writing
+
+        """
+        if perm not in ('w', 'r'):
+            raise ValueError(f'Unsure on permission "{perm}"')
+        with open(f'alt_redspec/jsons/{self.ob}_{self.resolution}_{self.prog}_{objname}.json', perm) as jfile:
+            if perm == 'w':
+                json.dump(jobj, jfile)
+                return
+            elif perm == 'r':
+                jobj: dict = json.load(jfile)
+                return jobj
+
+    def standard(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, str, np.ndarray,
+                                np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Reduces standard and creates conversion to absolute units
+
+        The observation is stacked on its median, bias subtracted, bad pixel masked and flat fielded
+        before the signal is extracted along
+        the dispersion axis with pixels converted to wavelength. Using the model, a calibration function of counts
+        to flux is determined.
+        """
+        # initialise
+        self.logger(f'The standard has {len(glob.glob(self.ptostds))} standard files')
+        biasplot = self.axesstd[4].imshow(self.master_bias, cmap='BuPu', origin='lower', aspect='auto')
         plt.colorbar(biasplot, ax=self.axesstd[4])
-        ptobest_flat = f'Raw/{res}/{prog}/{obsblock}/flat/0*.fits'
-        self.logger(f'The standard has {len(glob.glob(ptobest_flat))} flats files')
-        flat = self.flat(ptobest_flat, bias)
-        flatplot = self.axesstd[5].imshow(flat, cmap='BuPu', origin='lower', aspect='auto')
+        flatplot = self.axesstd[5].imshow(self.master_flat, cmap='BuPu', origin='lower', aspect='auto')
         plt.colorbar(flatplot, ax=self.axesstd[5])
         bpmplot = self.axesstd[6].imshow(self.bpm, cmap=ccd_bincmap, origin='lower', aspect='auto')
         plt.colorbar(bpmplot, ax=self.axesstd[6])
-        standard_list = self.checkifspectra(glob.glob(ptobest_std))  # list of standards)
+        standard_list = self.checkifspectra(glob.glob(self.ptostds))  # list of standards)
         sname = self.get_header_info(standard_list[-1])[0]  # gets name of standard
         sname = sname.split('_')[-1].lower().replace('-', '')  # converting standard name from header to model name
+        # stack raw data
         all_standards = np.stack([self.fopener(obj) for obj in standard_list])
         median_standard = self.med_stack(all_standards)  # median stack objects
         self.axesstd[0].imshow(median_standard, cmap='coolwarm', norm=imgnorm, origin='lower', aspect='auto')
         self.axesstd[0].set_title(f'Median Stack ({len(all_standards)} standard/s)')
-        all_standards = np.stack([self.bisub(bias, std) for std in all_standards])
+        # bias subtract
+        all_standards = np.stack([self.bisub(std, self.master_bias) for std in all_standards])
         median_standard = self.med_stack(all_standards)  # median stack the bias subtracted standards
-        stdcoord = self.get_pixcoord(median_standard)
+        stdcoord = self.get_pixcoord(median_standard)  # centre pixel
         self.logger(f'Central pixel for standard around {stdcoord + 1}')
         self.axesstd[1].imshow(median_standard, cmap='coolwarm', norm=imgnorm, origin='lower', aspect='auto')
-        flat_standard = self.flat_field(flat, median_standard)  # flat field the standard
+        # flat field
+        flat_standard = self.flat_field(median_standard, self.master_flat)  # flat field the standard
         self.axesstd[2].imshow(flat_standard, cmap='coolwarm', norm=imgnorm, origin='lower', aspect='auto')
-        fixed_standard = self.inf_fix(flat_standard)  # fix infinite counts, acts as a bad pixel mask
+        # apply bad pixel mask
+        fixed_standard = flat_standard
         self.axesstd[3].imshow(fixed_standard, cmap='coolwarm', norm=imgnorm, origin='lower', aspect='auto')
-        with open(f'alt_redspec/jsons/{obsblock}_{res}_{prog}_{sname}.json', 'w') as jfile:
-            json.dump({}, jfile)
-        with open(f'alt_redspec/jsons/{obsblock}_{res}_{prog}_{sname}.json', 'r') as jfile:
-            jdict = json.load(jfile)
+        # extract spectra
+        self.json_handler(sname, 'w', {})
+        jdict = self.json_handler(sname, 'r')
         pixel, photons, resid, aptleft, aptcent, aptright, back, jdict = self.extract(fixed_standard, jdict, stdcoord)
-        with open(f'alt_redspec/jsons/{obsblock}_{res}_{prog}_{sname}.json', 'w') as jfile:
-            json.dump(jdict, jfile)
+        if dojsons:
+            self.json_handler(sname, 'w', jdict)
+        del jdict
         outcpix = aptcent
         aptleftdiff = aptcent - aptleft
         aptrightdiff = aptright - aptcent
-        aptcent = aptcent - 50 + stdcoord + 1
+        aptcent = aptcent - config.stripewidth // 2 + stdcoord + 1
         aptleft = aptcent - aptleftdiff
         aptright = aptcent + aptrightdiff
         reducplot = self.axesstd[7].imshow(resid, cmap='coolwarm', norm=imgnorm, origin='lower', aspect='auto',
-                                           extent=(
-                                           stdcoord - 25, stdcoord + 26, self.pixlow, self.pixhigh))
+                                           extent=(stdcoord - config.stripewidth // 4,
+                                                   stdcoord + 1 + config.stripewidth // 4,
+                                                   self.pixlow, self.pixhigh))
         plt.colorbar(reducplot, ax=self.axesstd[7])
         self.axesstd[7].plot(aptleft, pixel, color='black', lw=1, ls='--')
         self.axesstd[7].plot(aptright, pixel, color='black', lw=1, ls='--')
@@ -1022,22 +1066,21 @@ class OB:
         error = self.poisson(photons)  # creating the errors
         self.axesstd[8].errorbar(pixel, photons + back, yerr=error, color='green')
         self.axesstd[8].plot(pixel, back, color='orange')
-        ptobest_arcs = f'Raw/{res}/{prog}/{obsblock}/arc/0*.fits'
-        self.logger(f'The standard has {len(glob.glob(ptobest_arcs))} arc files')
-        wave, arcpix, arcwave = self.transform(pixel, aptcent, ptobest_arcs)  # transform pixels to wavelength
+        # wavelength calibrate
+        wave = self.arc_solution(pixel, aptcent, self.ptoarcs)
         self.axesstd[9].errorbar(wave, photons, yerr=error)
-        # self.axesstd[12].plot(arcpix, arcwave, color='red')
-        wave, photons, error, ftoabs, ftoabs_error, \
-        vegwave, vegflux, vegerr = self.vector_func(sname, wave, photons, error)  # vector constant
+        # create flux calibration function
+        wave, photons, error, ftoabs, ftoabs_error,\
+        modwave, modflux, moderr = self.vector_func(sname, wave, photons, error)  # calib function
         self.axesstd[10].errorbar(wave, photons, yerr=error)
-        self.axesstd[13].errorbar(vegwave, vegflux, yerr=vegerr, color='red')
+        self.axesstd[13].errorbar(modwave, modflux, yerr=moderr, color='red')
         self.axesstd[14].errorbar(wave, ftoabs, yerr=ftoabs_error, color='red')
+        # calibrate standard fluxes
         wave, flux, error, sname = self.calibrate_real(wave, photons, error, sname,
                                                        ftoabs, ftoabs_error)  # real units spectra
         self.axesstd[11].errorbar(wave, flux, yerr=error)
         calib_standard = np.array((wave, flux, error))
-        # self.figstd.suptitle(f'{obsblock} {res} {prog} {sname}')
-        return ftoabs, calib_standard, ftoabs_error, sname, resid, obsblock, res, prog,\
+        return ftoabs, calib_standard, ftoabs_error, sname, resid,\
             outcpix, aptleftdiff, aptrightdiff
 
     def calibrate_real(self, wave: np.ndarray,
@@ -1071,12 +1114,7 @@ class OB:
         tempname = name.split('_')[-1].lower().replace('-', '')  # if object is a standard convert it
         if tempname in dist_std.keys():
             name = tempname
-        # wave, photons, error = self.confining_region(wave, photons, error, wavereg)  # constrict regime
         flux = photons / ftoabs  # determine the absolute flux at the Earth
-        if self.resolution == 'R0300R':  # to correct for second order contamination
-            # correction = np.loadtxt('R300R_correction_function.txt', unpack=True, usecols=(1, ))
-            correction = np.ones_like(flux)
-            flux *= correction
         error = self.calibrate_errorprop(flux, error, ftoabserr, ftoabs)  # propagate the error on flux
         return wave, flux, error, name
 
@@ -1087,88 +1125,63 @@ class OB:
         takes all the values and averages them
         """
         object_list = self.checkifspectra(glob.glob(self.ptoobj))  # list of objects
-        hum = np.array([self.get_header_info(fname)[1] for fname in object_list])
-        air = np.array([self.get_header_info(fname)[2] for fname in object_list])
-        mjd = np.array([self.get_header_info(fname)[3] for fname in object_list])
+        hum, air, mjd = np.empty(0), np.empty(0), np.empty(0)
+        for fname in object_list:
+            _hum, _air, _mjd = self.get_header_info(fname)[1:]
+            _params = _hum, _air, _mjd
+            params = [hum, air, mjd]
+            for i, param in enumerate(params):
+                param = np.append(param, _params[i])
+                params[i] = param
+            hum, air, mjd = params
         return round(np.mean(hum), 2), round(np.mean(air), 2), round(np.mean(mjd), 2)
 
-    def humairdiff(self, line: str) -> Tuple[str, float]:
-        """Finds the difference between airmass and humidity
-
-        Compares the airmass and humidity of the observation with that of the standard
-
-        Parameters
-        ----------
-        line : str
-            Given a line in a file in which the name, humidity and airmass are stored
-        """
-        res = line.split('_')[2]  # resolution of the WD standard
-        if res != self.resolution:
-            return [line.strip('\n'), np.inf]  # don't use observations from different resolutions
-        hum = float(line.split('_')[3])
-        air = float(line.split('_')[4])  # humidity and airmass of WD standard
-        mjd = float(line.split('_')[5])
-        humdiff = abs(hum - self.humidity)  # difference between standard and target in humidity
-        airdiff = abs(air - self.airmass)  # difference between standard and target in airmass
-        mjddiff = abs(mjd - self.mjd)  # difference between standard and target in time
-        return [line.strip('\n'), np.sqrt((humdiff / 60) ** 2 + (airdiff / 1.5) ** 2 + (mjddiff / 365) ** 2)]
-
-    def closest_standard(self) -> str:
-        """Finds the closest standard in terms of airmass and humidity
-
-        Opens the listed file and determines the combined distance in airmass and humidity - space and determines
-        which one has the least distance to the target.
-        """
-        with open('good_wds.txt', 'r+') as f:
-            all_diffs = np.stack([self.humairdiff(line) for line in f])  # all standards checked
-            lowest_diff_ind = np.argmin(all_diffs[:, 1])  # minimum difference index
-        self.logger(f'Separation from object is {all_diffs[lowest_diff_ind, -1]}')
-        return all_diffs[lowest_diff_ind, 0]  # select the standard with the least difference
-
-    def object(self, ptoobj: str) -> Tuple[np.ndarray, str, np.ndarray]:
+    def object(self) -> Tuple[np.ndarray, str, np.ndarray]:
         """Reduce the target spectra
 
         The target object, if there are multiple observations, is stacked into 3D and then unstacked on the median to
         the 2D CCD. It is then bias subtracted, flat fielded and bad pixel masked before being having its spectra
         extracted and background subtracted. Pixels are converted to wavelength via use of the corresponding arcmap.
         Photon count is converted to absolute flux at 10 pc by use of a calibration function derived from the standards
-        to WD model relation and distance scaled.
-
-        Parameters
-        ----------
-        ptoobj : str
-            The UNIX path to the spectra being reduced
+        to model relation and distance scaled.
         """
-        object_list = self.checkifspectra(glob.glob(ptoobj))  # list of objects
+        # initialise
+        object_list = self.checkifspectra(glob.glob(self.ptoobj))  # list of objects
         tname = self.get_header_info(object_list[-1])[0]
+        # raw data
         all_objects = np.stack([self.fopener(obj) for obj in object_list])
         median_object = self.med_stack(all_objects)  # median stack objects
-        coordinate = self.get_pixcoord(median_object)  # find pixel coordinate
-        self.logger(f'Central pixel for object around {coordinate + 1}')
         self.axesobj[0].imshow(median_object, cmap='coolwarm', norm=imgnorm, origin='lower', aspect='auto')
         self.axesobj[0].set_title(f'Median Stack ({len(all_objects)} object/s)')
-        all_objects = np.stack([self.bisub(self.master_bias, obj) for obj in all_objects])
+        # centre coordinate
+        coordinate = self.get_pixcoord(median_object)  # find pixel coordinate
+        self.logger(f'Central pixel for object around {coordinate + 1}')
+        # bias subtract
+        all_objects = np.stack([self.bisub(obj, self.master_bias) for obj in all_objects])
         median_object = self.med_stack(all_objects)  # median stack bias subtracted objects
         self.axesobj[1].imshow(median_object, cmap='coolwarm', norm=imgnorm, origin='lower', aspect='auto')
-        flat_object = self.flat_field(self.master_flat, median_object)  # flat field the object
+        # flat field
+        flat_object = self.flat_field(median_object, self.master_flat)  # flat field the object
         self.axesobj[2].imshow(flat_object, cmap='coolwarm', norm=imgnorm, origin='lower', aspect='auto')
-        fixed_object = self.inf_fix(flat_object)  # fix infinite counts, acts as a bad pixel mask
+        # apply bad pixel mask
+        fixed_object = flat_object
         self.axesobj[3].imshow(fixed_object, cmap='coolwarm', norm=imgnorm, origin='lower', aspect='auto')
-        with open(f'alt_redspec/jsons/{self.ob}_{self.resolution}_{self.prog}_{tname}.json', 'w') as jfile:
-            json.dump({}, jfile)
-        with open(f'alt_redspec/jsons/{self.ob}_{self.resolution}_{self.prog}_{tname}.json', 'r') as jfile:
-            jdict = json.load(jfile)
+        # extract spectra
+        self.json_handler(tname, 'w', {})
+        jdict = self.json_handler(tname, 'r')
         pixel, photons, resid,\
         aptleft, aptcent, aptright, back, jdict = self.extract(fixed_object, jdict, coordinate)
-        with open(f'alt_redspec/jsons/{self.ob}_{self.resolution}_{self.prog}_{tname}.json', 'w') as jfile:
-            json.dump(jdict, jfile)
+        if dojsons:
+            self.json_handler(tname, 'w', jdict)
+        del jdict
         reducplot = self.axesobj[7].imshow(resid, cmap='coolwarm', norm=imgnorm, origin='lower', aspect='auto',
-                                           extent=(
-                                           coordinate - 25, coordinate + 26, self.pixlow, self.pixhigh))
+                                           extent=(coordinate - config.stripewidth // 4,
+                                                   coordinate + 1 + config.stripewidth // 4,
+                                                   self.pixlow, self.pixhigh))
         plt.colorbar(reducplot, ax=self.axesobj[7])
         aptleftdiff = aptcent - aptleft
         aptrightdiff = aptright - aptcent
-        aptcent = aptcent - 50 + coordinate + 1
+        aptcent = aptcent - config.stripewidth // 2 + coordinate + 1
         aptleft = aptcent - aptleftdiff
         aptright = aptcent + aptrightdiff
         self.axesobj[7].plot(aptleft, pixel, color='black', lw=1, ls='--')
@@ -1177,9 +1190,10 @@ class OB:
         error = self.poisson(photons)  # creating the errors
         self.axesobj[8].errorbar(pixel, photons + back, yerr=error, color='green')
         self.axesobj[8].plot(pixel, back, color='orange')
-        wave, arcpix, arcwave = self.transform(pixel, aptcent, self.ptoarcs)  # transform pixels to wavelength
+        # wavelength calibrate
+        wave = self.arc_solution(pixel, aptcent, self.ptoarcs)
         self.axesobj[9].errorbar(wave, photons, yerr=error)
-        # self.axesobj[12].plot(arcpix, arcwave, color='red')
+        # flux calibrate
         wave, flux, error, tname = self.calibrate_real(wave, photons, error, tname,
                                                        self.ftoabs, self.ftoabs_error)  # real units spectra
         self.axesobj[10].errorbar(wave, flux, yerr=error)
@@ -1202,7 +1216,7 @@ class OB:
                     format='ascii.no_header', overwrite=True)
         tstand = Table(data=self.master_standard.T)  # the standard from the same observing block as standard
         tstand.write(f'{ptostore}/standards/'
-                     f'{self.ob}_{self.resolution}_{self.prog}_{self.actual_standard}_{self.standard_name}.txt',
+                     f'{self.ob}_{self.resolution}_{self.prog}_{self.standard_name}.txt',
                      format='ascii.no_header', overwrite=True)
         tbias = Table(data=self.master_bias)
         tbias.write(f'{ptostore}/bias/'
@@ -1256,10 +1270,14 @@ class OB:
         self.axesstd[10].set_xlabel(r'$\lambda\ [\AA]$')
         self.axesstd[10].set_ylabel('Counts')
         self.axesstd[10].set_yscale('linear')
-        for ax in (self.axesstdarc, self.axesstd[12], self.axesobjarc, self.axesobjarc):
-            ax.set_xlabel(r'$\lambda\ [\AA]$')
-            ax.set_ylabel('Pixel Shifts from Master')
+        for ax in (self.axesstdarc, self.axesstd[12], self.axesobjarc, self.axesobj[12]):
+            ax.set_xlabel('Y Pixel [pix]')
             # ax.set_ylim(0, 65535)
+        for ax in (self.axesobjarc, self.axesstdarc):
+            ax.set_ylabel(r'$\Delta \lambda\ [\AA]$')
+            ax.legend()
+        for ax in (self.axesstd[12], self.axesobj[12]):
+            ax.set_ylabel(r'$\lambda\ [\AA]$')
         self.axesobj[13].set_title('Calibration Function')
         self.axesobj[13].set_xlabel(r'$\lambda\ [\AA]$')
         self.axesobj[13].set_ylabel(r'$\mathrm{Counts}\ F_{\lambda}^{-1}\ [\mathrm{erg}^{-1}\ \mathrm{cm}\ s\ \AA]$')
@@ -1278,7 +1296,7 @@ class OB:
         for fig in (self.figobj, self.figstd):
             fig.tight_layout(pad=1.5)
         objfname = f'{self.ob}_{self.resolution}_{self.prog}_{self.target}.png'
-        stdfname = f'{self.stdobs}_{self.stdres}_{self.stdprog}_{self.standard_name}_for_{self.target}.png'
+        stdfname = f'{self.ob}_{self.resolution}_{self.prog}_{self.standard_name}_for_{self.target}.png'
         for fname in (objfname, stdfname):
             fnameback = fname[:fname.find('.png')] + '.bak.png'
             try:
@@ -1365,42 +1383,156 @@ class BPM:
         return
 
 
-def repeat_check():
-    """Checks if an object has been observed in multiple observing blocks
-
-    If an object has been observed multiple times, median stack their reduced spectra (if resolution is different)
+class Config:
     """
+    Config file parameters for use in reduction
+    """
+    def __init__(self, conf_fname: str):
+        """
+        Create all parameters
 
-    def quick_error_prop(error_array: np.ndarray) -> np.ndarray:
-        """Propagates error by adding in quadrature"""
-        errs = np.stack([x ** 2 for x in error_array])
-        return np.sqrt(np.sum(errs, axis=0))
+        Parameters
+        ----------
+        conf_fname: str
+            The filename of the plain text config file
+        """
+        self.fname = conf_fname
+        self.allparams = self.fopen()
+        self.rawpath, self.redpath, self.targetlist,\
+        self.minpix, self.maxpix, self.stripewidth, self.cpix,\
+        self.minwave, self.maxwave = self.getparams()
+        return
 
-    done_list = np.array(glob.glob('alt_redspec/objects/*txt'))
-    restgt = np.array([])
-    for f in done_list:
-        f = f.strip('.txt').split('/')[-1].split('_')
-        restgt = np.append(restgt, f[1] + '_' + f[-1])
-    for i in range(len(restgt)):
-        c, this = 0, np.array([], dtype=int)
-        for j in range(len(restgt)):
-            if restgt[i] == restgt[j]:
-                c += 1
-                this = np.append(this, j)
-        if c > 1:
-            name = str(restgt[i]).split('_')
-            name = f'OB-comb_{name[0]}_GTC-comb_{name[1]}'
-            try:
-                all_wave = np.stack([np.loadtxt(done_list[n], unpack=True, usecols=(0,)) for n in this])
-                all_flux = np.stack([np.loadtxt(done_list[n], unpack=True, usecols=(1,)) for n in this])
-                all_error = np.stack([np.loadtxt(done_list[n], unpack=True, usecols=(1,)) for n in this])
-                [os.system(f"rm {done_list[n]}") for n in this]
-                t = Table(data=(np.median(all_wave, axis=0), np.median(all_flux, axis=0),
-                                quick_error_prop(all_error)))
-                t.write(f'alt_redspec/objects/{name}.txt', overwrite=True, format='ascii.no_header')
-            except (FileNotFoundError, OSError):
-                pass
-    return
+    def getparams(self):
+        """
+        Grabs all parameters from the dictionary
+
+        Returns
+        -------
+        rawpath: str
+            Path to raw data to be reduced
+        redpath: str
+            Path to storage folder
+        targetlist: str
+            The name of the file with added data (e.g. exact target names, else taken from header)
+        minpix: int
+            The minimum pixel to extract on the ccd
+        maxpix: int
+            The maximum pixel to extract on the ccd
+        stripewidth: int
+            The width of pixels down the dispersion axis
+        cpix: int
+            The typical central pixel
+        minwave: int
+            Minimum wavelength in Angstroms
+        maxwave: int
+            Maximum wavelength in Angstroms
+        """
+        rawpath, redpath, targetlist, minpix, maxpix,\
+        stripewidth, cpix,\
+        minwave, maxwave = '', '', '', 1, 2051, 100, 250, 5000, 10000
+        for key in self.allparams:
+            if key == 'rawpath':
+                rawpath = self.allparams[key]
+                if rawpath == '' and \
+                        np.any([not glob.glob(folder) for folder in ['arc', 'bias', 'flat', 'stds', 'object']]):
+                    raise ValueError('Using default value for raw data path, it is empty')
+            elif key == 'redpath':
+                redpath = self.allparams[key]
+                if redpath == '':
+                    warnings.warn('Using default value (current dir) for reduced data path')
+            elif key == 'targetlist':
+                targetlist = self.allparams[key]
+                if targetlist == '':
+                    warnings.warn('No target list given, will default to header values')
+            elif key == 'minpix':
+                try:
+                    minpix = int(self.allparams[key])
+                except ValueError:
+                    warnings.warn('Using default value for min pixel (1)')
+            elif key == 'maxpix':
+                try:
+                    maxpix = int(self.allparams[key])
+                except ValueError:
+                    warnings.warn('Using default value for max pixel (2051)')
+            elif key == 'stripewidth':
+                try:
+                    stripewidth = int(self.allparams[key])
+                except ValueError:
+                    warnings.warn('Using default value for stripe width (100)')
+            elif key == 'cpix':
+                try:
+                    cpix = int(self.allparams[key])
+                except ValueError:
+                    warnings.warn('Using default value for central pixel (250)')
+            elif key == 'minwave':
+                try:
+                    minwave = int(self.allparams[key])
+                except ValueError:
+                    warnings.warn('Using default value for minimum wavelength (5000A)')
+            elif key == 'maxwave':
+                try:
+                    maxwave = int(self.allparams[key])
+                except ValueError:
+                    warnings.warn('Using default value for maximum wavelength (10000A)')
+            else:
+                warnings.warn(f'Unknown key {key}')
+        return rawpath, redpath, targetlist, minpix, maxpix, stripewidth, cpix, minwave, maxwave
+
+    def fopen(self):
+        """
+        Opens the config file, will skip first line
+
+        Returns
+        -------
+        d: dict
+            All the variables
+        """
+        d, delim = {}, ':'
+        with open(self.fname, 'r') as f:
+            for i, line in enumerate(f):
+                linesplit, delim = self.what_delim(line.rstrip('\n'), delim)
+                if not i:
+                    continue
+                key = linesplit[0].strip()
+                value = linesplit[1].strip()
+                d[key] = value
+        return d
+
+    @staticmethod
+    def what_delim(s: str, fg: str = ':') -> Tuple[Sequence, str]:
+        """
+        Tries a few different delimiters to split a line
+
+        Parameters
+        ----------
+        s: str
+            The string to be split on
+        fg: str
+            The first guess of the delimiter
+
+        Returns
+        -------
+        sl: Sequence
+            The split list
+        delim: str
+            The delimiter that worked on this row
+        """
+        delims = {':', '#', '\t', ' ', ',', '='}
+        sl = s.split(fg)
+        try:
+            if not len(sl) - 1:  # not split properly
+                raise IndexError
+        except IndexError:
+            for delim in delims.difference(fg):
+                sl = s.split(delim)
+                if len(sl) == 2:
+                    break
+            else:
+                raise KeyError(f'Cannot parse config file correctly, expecting delimiters from: {delims}')
+        else:
+            delim = fg
+        return sl, delim
 
 
 def main():
@@ -1420,41 +1552,50 @@ def main():
     warnings.simplefilter("ignore", category=RuntimeWarning)  # another warning is for runtime, ignore this
     warnings.simplefilter('ignore', np.RankWarning)  # another warning about poorly fitting polynomial, ignore
     warnings.simplefilter('ignore', OptimizeWarning)
-    ob_list = glob.glob('Raw/R**/G**/OB*')  # list of observing blocks
+    ob_list = glob.glob(config.rawpath)
+    redpth = config.redpath
 
-    # check requirements
-    if glob.glob('*arcmap.txt').__len__() != 2:
-        raise FileNotFoundError('Cannot find pixel - wave conversion in environment')
+    # check for required directories and files
+    if 'alt_done.log' not in os.listdir('.'):
+        with open('alt_done.log', 'w+'):  # empty the log file
+            pass
+    if not glob.glob(redpth):
+        warnings.warn(f'Could not find {redpth}, attempting to create')
+        os.mkdir(redpth)
+    for folder in ('arcs', 'bias', 'calib_funcs', 'flat',
+                   'jsons', 'log', 'objects', 'reduction', 'residuals', 'standards'):
+        if not glob.glob(f'{redpth}/{folder}'):
+            warnings.warn(f'Trying to make folder in {redpth}')
+            os.mkdir(f'{redpth}/{folder}')
 
     # check BPM and make otherwise
-    if glob.glob('BPM_*_python.txt').__len__() != 2:
+    if len(glob.glob('BPM_*_python.txt')) != 2:
         print('No bad pixel masks present, creating now from all flats per resolution.')
         bpm = BPM()
-        bpm.make_bpm('Raw/R2500I/G**/OB**/flat/0*fits')  # make the R2500I BPM
-        bpm.make_bpm('Raw/R0300R/G**/OB**/flat/0*fits')  # make the R300R BPM
-        print('Made bad pixel masks.')
+        bpm.make_bpm(f'{config.rawpath}/flat/0*fits')  # make the BPM
+        print('Made bad pixel mask.')
 
     # prompt user if they want to repeat all reductions
     do_all = args.do_all
+    do_repeat = args.repeat
     if do_all:
-        if len(glob.glob('alt_redspec/**/*txt')) > 0:
-            os.system("rm alt_redspec/**/*txt")  # delete the spectra
-        f = open('alt_done.log', 'w+')  # empty the log file
-        f.close()
-
-    # checking which files have already been reduced
-    ob_list = np.array(ob_list)
-    done_list = np.array([], dtype=bool)
-    for obs in ob_list:
-        with open('alt_done.log', 'r') as f:
-            for line in f:
-                if obs.split('/')[-1] in line and obs.split('/')[1] in line and obs.split('/')[2] in line:
-                    done_list = np.append(done_list, False)
-                    break
-            else:
-                done_list = np.append(done_list, True)
-    ob_list = ob_list[done_list]
-    ob_list = np.array(['Raw/R2500I/GTC54-15A0/OB0055'])
+        if len(glob.glob(f'{redpth}/**/*txt')):
+            os.system(f'rm {redpth}/**/*txt')  # delete the spectra
+        with open('alt_done.log', 'w+'):  # empty the log file
+            pass
+    if not do_repeat:
+        # checking which files have already been reduced
+        ob_list = np.array(ob_list)
+        done_list = np.array([], dtype=bool)
+        for obs in ob_list:
+            with open('alt_done.log', 'r') as f:
+                for line in f:
+                    if obs.split('/')[-1] in line and obs.split('/')[1] in line and obs.split('/')[2] in line:
+                        done_list = np.append(done_list, False)
+                        break
+                else:
+                    done_list = np.append(done_list, True)
+        ob_list = ob_list[done_list]
 
     # thread the unreduced files
     if len(ob_list):
@@ -1465,20 +1606,11 @@ def main():
         pool = multiprocessing.Pool(processes=avail_cores)
         pool.map(OB, ob_list)
         pool.close()
-        # repeat_check()
         print('Done with spectra.')
         print(f'Run took {round((time.time() - t0) / 60, 1)} minutes.')
     else:
         print(f'Process took {round(time.time() - t0, 1)} seconds.')
 
-    # prompt user if they want to make all the plots
-    do_plot = args.do_plots
-    if do_plot:
-        sys.dont_write_bytecode = True
-        tplot0 = time.time()
-        import alt_plot
-        alt_plot.main()
-        print(f'Done with plotting in {round((time.time() - tplot0) / 60, 1)} minutes.')
     print(f'Total time taken was {round((time.time() - t0) / 60, 1)} minutes.')
     return
 
@@ -1488,8 +1620,12 @@ if __name__ == '__main__':  # if called as script, run main module
     ccd_bincmap = LinearSegmentedColormap.from_list('bincmap', plt.cm.binary_r(np.linspace(0, 1, 2)), N=2)
     myargs = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     myargs.add_argument('-a', '--do-all', action='store_true', default=False, help='Do all spectra?')
-    myargs.add_argument('-p', '--do-plots', action='store_true', default=False, help='Generate Further Plots?')
+    myargs.add_argument('-r', '--repeat', action='store_true', default=False, help='Re-do already reducted spectra?')
+    myargs.add_argument('-c', '--config-file', help='The config file', required=True)
+    myargs.add_argument('-j', '--gen-jsons', action='store_true', default=False, help='Create jsons for live plots?')
     args = myargs.parse_args()
+    dojsons = args.gen_jsons
+    config = Config(args.config_file)
     rc('text', usetex=True)
     rcParams.update({'axes.labelsize': 'small', 'axes.titlesize': 'small',
                      'xtick.labelsize': 'small', 'ytick.labelsize': 'small',
@@ -1499,6 +1635,6 @@ if __name__ == '__main__':  # if called as script, run main module
                      'font.family': 'serif', 'legend.frameon': False, 'legend.facecolor': 'none',
                      'mathtext.fontset': 'cm', 'mathtext.default': 'regular',
                      'figure.figsize': [4, 3], 'figure.dpi': 144,
-                     'xtick.top': True, 'ytick.right': True, 'legend.handletextpad': -0.5,
+                     'xtick.top': True, 'ytick.right': True, 'legend.handletextpad': 0.5,
                      'xtick.minor.visible': True, 'ytick.minor.visible': True})
     main()
