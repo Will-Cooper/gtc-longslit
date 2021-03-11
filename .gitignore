@@ -59,4 +59,8 @@ lastsesh.py
 reduced.log
 reduced/
 temp_cpix_vals.txt
+extractplot.py
+parameter_calculation.py
+quickviewspec.py
+rv_lines.py
 

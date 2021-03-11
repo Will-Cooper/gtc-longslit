@@ -29,6 +29,8 @@ minwave : int (Angstroms)
     The mimimum wavelength of the grism (used to cut the line list)
 maxwave : int (Angstroms)
     The maximum wavelength of the grism (used to cut the line list)
+maxthread : int
+    The number of threads to use multiprocessing on
 
 Required file:
     * <name>.config  -- file containing config arguments, see example
@@ -40,13 +42,8 @@ OB : str
 BPM : str
     Determines the bad pixel mask if the corresponding resolution mask does not exist in the current environment
 Config : str
-    Parses the config file for the required arguments: rawpath, redpath, targetlist,
-     minpix, maxpix, stripewidth, cpix, minwave, maxwave
-
-Methods
--------
-main
-    Main function of the script to make bad pixel mask if needed, error handle and reduce the spectra
+    Parses the config file for the required arguments: rawpath, redpath, targetlist, head_actual
+     minpix, maxpix, stripewidth, cpix, minwave, maxwave, maxthread
 """
 import numpy as np  # general mathematics and array handling
 from numpy.polynomial.polynomial import Polynomial as Poly
