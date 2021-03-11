@@ -49,4 +49,14 @@ spec_typecm.csv
 spectral_types.csv
 spex_spectra/
 temp_cm.csv
+OB0055_files
+arbitrary_plots/
+fitting_plots/
+genplots.py
+iraf/
+lablinelist/
+lastsesh.py
+reduced.log
+reduced/
+temp_cpix_vals.txt
 
