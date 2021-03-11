@@ -1,16 +1,35 @@
-A Python-3 script to reduce GTC OSIRIS longslit optical spectra. Currently only supporting R300R and R2500I.
-It is designed to be similar in function to IRAF/ apall.
-There is also a script to plot the resultant data.
-It is currently only useful for my data and file structure but should be full released in Cooper et al. (in prep)
-<b> This is very much a WIP, there are an unacceptable number of hard coded variables and files.
-Eventually these will be removed and the code edited to allow anyone to easily use.</b>
+A Python-3 script to reduce GTC OSIRIS longslit optical spectra.
 
-It is designed to work over multiple processors and will require a folder 'alt_redspec/' containing
-'objects/', 'standards/', 'residuals/' and 'calib_funcs/'. On the upper level it will place the plots
-(made in the alt_plot.py script) of the resultant spectra.
+It is designed to work over multiple processors and will require a directory for the reduced spectra to be put in,
+this is the redpath argument in the config file.
 
-It will search for spectra in the current directory sub-folder 'Raw/' in which we expect in subsequent order:
-'resolution/programme_ID/observing_block/' where those folders correspond with YOUR values
-(e.g. 'Raw/R2500I/GTC54-15ITP/OB0001/'), inside each observing block directory we also expect:
-'bias/', 'flat/', 'object/' and 'stds/' inside which are the fits files beginning with '0'.
+It will search for raw spectra in the config rawpath argument (without ending slash) in which we expect:
+'resolution/programme_ID/observing_block/' inside each observing block directory we also expect:
+'bias/', 'flat/', 'object/', 'arc/' and 'stds/' inside which are the fits files beginning with '0'.
 
+**Config parameters include:**  
+**rawpath** : str  
+    Path to the raw spectra  
+**redpath** : str  
+    Path to the reduced spectra  
+**targetlist** : str (optional)  
+    Name of a file that contains an the header name and actual target name  
+**head_actual** : str (optional)  
+    The column names in said targetlistl, split as head_actual to convert from header name to actual target name  
+**minpix** : int (pixel)  
+    The minimum pixel on the dispersion axis to reduce within  
+**maxpix** : int (pixel)  
+    The maximum pixel on the dispersion axis to reduce within  
+**stripewidth** : int (pixel)  
+    The width in pixels over which to determine background/ find the source (larger=better but beware of shifts)  
+**cpix** : int (pixel)  
+    The central pixel one could typically find the spectra (not used in actual extraction)  
+**minwave** : int (Angstroms)  
+    The mimimum wavelength of the grism (used to cut the line list)  
+**maxwave** : int (Angstroms)  
+    The maximum wavelength of the grism (used to cut the line list)  
+**maxthread** : int  
+    The number of threads to use multiprocessing on  
+
+**Required file:**  
+    * <name>.config  -- file containing config arguments, see examples ```all_r2500.config```, ```all_r300.config```
