@@ -404,14 +404,14 @@ class OB:
         pcomb: Poly
             The combined polynomial solution
         """
-        linfit: Poly = Poly.fit(df.pixel.values, df.wave.values, deg=1)  # linear fit
+        linfit = Poly.fit(df.pixel.values, df.wave.values, deg=1, full=True)[0]  # linear fit
         residual = linfit(df.pixel.values) - df.wave.values
         df = df[np.logical_and(np.abs(residual) < 100,
                                np.logical_and(df.pixel > self.pixlow + 100,
                                               df.pixel < self.pixhigh - 100))].copy()
-        linfit = Poly.fit(df.pixel.values, df.wave.values, deg=1)  # linear fit
+        linfit = Poly.fit(df.pixel.values, df.wave.values, deg=1, full=True)[0]  # linear fit
         residual = linfit(df.pixel.values) - df.wave.values
-        thirdorder: Poly = Poly.fit(df.pixel.values, residual, deg=3)
+        thirdorder: Poly = Poly.fit(df.pixel.values, residual, deg=3, full=True)[0]
         ax.plot(df.pixel, thirdorder(df.pixel.values), 'yx', label='Linear Residual 1')
         ax.plot(*thirdorder.linspace(), 'y--', label='3rd Order Fit 1')
         pcomb = linfit - thirdorder
@@ -425,9 +425,9 @@ class OB:
         residual = residual[np.abs(residual) < 2 * iqr]
         weights = np.divide(1, np.power(residual, 3), where=residual != 0)
         # do again from start, now with weights and some bad data removed
-        linfit = Poly.fit(df.pixel.values, df.wave.values, deg=1, w=weights)  # linear fit
+        linfit = Poly.fit(df.pixel.values, df.wave.values, deg=1, w=weights, full=True)[0]  # linear fit
         residual = linfit(df.pixel.values) - df.wave.values
-        thirdorder = Poly.fit(df.pixel.values, residual, deg=3, w=weights)
+        thirdorder = Poly.fit(df.pixel.values, residual, deg=3, w=weights, full=True)[0]
         ax.plot(df.pixel, thirdorder(df.pixel.values), 'rx', label='Linear Residual 2')
         ax.plot(*thirdorder.linspace(), 'r--', label='3rd Order Fit 2')
         pcomb = linfit - thirdorder
@@ -522,7 +522,7 @@ class OB:
         spectral_list = np.array(spectral_list)  # convert to numpy array
         for spectra in spectral_list:
             head = getheader(spectra, ext=0)
-            if head['GRISM'] == 'OPEN':  # i.e. acquisiton
+            if head['GRISM'].strip() == 'OPEN':  # i.e. acquisiton
                 bo_arr = np.append(bo_arr, False)
             else:
                 bo_arr = np.append(bo_arr, True)
