@@ -109,7 +109,7 @@ class OB:
         self.figstdarc, self.axesstdarc = plt.subplots(figsize=(8, 5), dpi=300)
         self.axesstd = self.axesstd.flatten()
         # pixel limits
-        self.pixlow, self.pixhigh = self.pixel_constraints()
+        self.pixlow, self.pixhigh, self.indlow, self.indhigh = self.pixel_constraints()
         pbar.update(5)
         self.logger(f'Use pixels from {self.pixlow} to {self.pixhigh}')
         # bias
@@ -191,23 +191,23 @@ class OB:
                     break
         return sname
 
-    @staticmethod
-    def get_pixcoord(data: np.ndarray) -> int:
+    def get_pixcoord(self, data: np.ndarray) -> int:
         """Gets the pixel coordinate
 
         The row pixel where the spectra is normally, worked out from the median across the whole array
         """
+        data, offset = self.region_trim(data)
         coord = np.nanmedian(np.argmax(data, axis=-1)).astype(int)
-        return coord  # pixel to index conversion
+        return coord + offset  # average central pixel
 
     @staticmethod
-    def pixel_constraints() -> Tuple[int, int]:
+    def pixel_constraints() -> Tuple[int, int, int, int]:
         """Finds the constraints for the respective resolution
 
-        Use the config minpix and maxpix values to get the limits of extraction
+        Use the config minpix and maxpix values to get the limits of extraction in pixel and index space
         """
         xmin, xmax = config.minpix, config.maxpix
-        return xmin, xmax
+        return xmin, xmax, xmin - 1, xmax - 1
 
     @staticmethod
     def bisub(data: np.ndarray, bias: np.ndarray) -> np.ndarray:
@@ -301,6 +301,31 @@ class OB:
         median_bias = self.med_stack(all_bias)  # median stacks the biases
         return self.bpm_applying(median_bias)  # apply bad pixel mask
 
+    def region_trim(self, data: np.ndarray) -> Tuple[np.ndarray, int]:
+        """
+        Downsizes an array on the config specifications (pixel limits)
+
+        Parameters
+        ----------
+        data: np.ndarray
+            The full size array to be trimmed
+
+        Returns
+        -------
+        dtrimmed: np.ndarray
+            The trimmed array
+        low: int
+            The lowest index
+        """
+        low = config.cpix - config.stripewidth // 2 - 1
+        high = config.cpix + config.stripewidth // 2 - 1
+        if low < 0:
+            low = 0
+        if high > data.shape[1]:
+            high = data.shape[1]
+        dtrimmed = data[self.indlow: self.indhigh, low: high]
+        return dtrimmed, low
+
     def normalise(self, data: np.ndarray) -> np.ndarray:
         """Normalises to the mean value of array
 
@@ -311,13 +336,7 @@ class OB:
         data : np.ndarray
             The full CCD of the median flat
         """
-        low = config.cpix - config.stripewidth - 1
-        high = config.cpix + config.stripewidth - 1
-        if low < 0:
-            low = 0
-        if high > data.shape[1]:
-            high = data.shape[1]
-        dtrimmed = data[self.pixlow: self.pixhigh, low: high]
+        dtrimmed = self.region_trim(data)[0]
         return np.divide(data, np.median(dtrimmed))
 
     def flat(self, bias: np.ndarray) -> np.ndarray:
@@ -471,7 +490,7 @@ class OB:
             arcdata = getdata(arc, ext=2)  # extract whole arc
             arcdata = np.subtract(arcdata, self.master_bias)  # bias subtract
             arcdata = np.divide(arcdata, self.master_flat, where=self.master_flat != 0)  # flat field
-            arcdata = arcdata[self.pixlow: self.pixhigh]
+            arcdata = arcdata[self.indlow: self.indhigh]
             arccut = arcdata[np.arange(len(arcdata)), cpix.astype(int)].flatten()  # just extraction pixel
             lamp = getheader(arc, ext=0)['OBJECT'].split('_')[-1].lower()
             pix_wave = self.identify(pixel, arccut, lamp)
@@ -682,9 +701,9 @@ class OB:
         coord: int
             Central pixel
         """
-        data = data[self.pixlow:self.pixhigh,
+        data = data[self.indlow: self.indhigh,
                     coord - config.stripewidth // 2: coord + 1 + config.stripewidth // 2]  # slicing spectra
-        pixels = np.arange(self.pixlow, self.pixhigh) + 1
+        pixels = np.arange(self.pixlow, self.pixhigh)
         peaks, aptleft, aptcent, aptright, background = np.empty_like(pixels), np.empty_like(pixels), \
             np.empty_like(pixels), np.empty_like(pixels), np.empty_like(pixels)
         for i, row in enumerate(data):
@@ -820,7 +839,7 @@ class OB:
             The UNIX path to the file being opened as a string
         """
         head = getheader(fname, ext=0)  # the observational information on OSIRIS is on the first HDU
-        return head['OBJECT'].rstrip(), head['HUMIDITY'], head['AIRMASS'], head['MJD-OBS']
+        return head['OBJECT'].rstrip(), head['HUMIDITY'], head['AIRMASS'], head['MJD-OBS'], head['SLITW']
 
     def json_handler(self, objname: str, perm: str, jobj: dict = None):
         """
@@ -867,6 +886,8 @@ class OB:
         standard_list = self.checkifspectra(glob.glob(self.ptostds))  # list of standards)
         sname = self.get_header_info(standard_list[-1])[0]  # gets name of standard
         sname = sname.split('_')[-1].lower().replace('-', '')  # converting standard name from header to model name
+        slitwidths = [self.get_header_info(f)[-1] for f in standard_list]
+        self.logger(f'Standard has slit widths: {slitwidths}')
         # stack raw data
         all_standards = np.stack([self.fopener(obj) for obj in standard_list])
         median_standard = self.med_stack(all_standards)  # median stack objects
@@ -969,7 +990,7 @@ class OB:
         object_list = self.checkifspectra(glob.glob(self.ptoobj))  # list of objects
         hum, air, mjd = np.empty(0), np.empty(0), np.empty(0)
         for fname in object_list:
-            _hum, _air, _mjd = self.get_header_info(fname)[1:]
+            _hum, _air, _mjd = self.get_header_info(fname)[1:-1]
             _params = _hum, _air, _mjd
             params = [hum, air, mjd]
             for i, param in enumerate(params):
@@ -990,6 +1011,8 @@ class OB:
         # initialise
         object_list = self.checkifspectra(glob.glob(self.ptoobj))  # list of objects
         tname = self.get_header_info(object_list[-1])[0]
+        slitwidths = [self.get_header_info(f)[-1] for f in object_list]
+        self.logger(f'Object has slit widths: {slitwidths}')
         # raw data
         all_objects = np.stack([self.fopener(obj) for obj in object_list])
         median_object = self.med_stack(all_objects)  # median stack objects
