@@ -84,6 +84,14 @@ class OB:
     The extracted, wavelength calibrated standard is divided by its corresponding model spectra (F_lambda)
     to create the flux calibration. This is then applied to the final object spectra.
     """
+    # initialise class attributes (overrode by instance attributes)
+    figobj, axesobj, figstd, figobjarc, axesobjarc, figstdarc, axesstdarc, axesstd,\
+        pixlow, pixhigh, indlow, indhigh, ptobias, master_bias, ptoflats,\
+        master_flat, bpm, ptoobj, humidity, airmass, mjd, ptostds, ptoarcs,\
+        ftoabs, master_standard, ftoabs_error, standard_name, standard_residual,\
+        cpix, aptleft, aptright, haveaperture, master_target, target, target_residual = None, None, None, None, None,\
+    None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None,\
+    None, None, None, None, None, None, None, None, None, None, None
 
     def __init__(self, ptodata: str):
         """
@@ -100,6 +108,18 @@ class OB:
             print(f'Cannot reduce {self.resolution} {self.prog} {self.ob} due to missing directories')
             return
         self.logger(f'Resolution {self.resolution}\nProgramme {self.prog}\nObserving block {self.ob}', w=True)
+        try:
+            self.reduction(ptodata)
+        except ValueError as e:
+            print(f'Could not complete reduction of {self.ob} {self.prog} {self.resolution}')
+            print(e)
+            return
+        else:
+            print(f'Object processed: {self.target} for {self.resolution} '
+                  f'grism in {self.ob} with walltime {round(time.time() - tproc0, 1)} seconds.')
+        return
+
+    def reduction(self, ptodata: str):
         # initialising
         pbar = tqdm(total=100, desc=f'{self.resolution}/{self.prog}/{self.ob}')
         self.figobj, self.axesobj = plt.subplots(4, 4, figsize=(16, 10), dpi=300)
@@ -160,8 +180,6 @@ class OB:
         pbar.update(5)
         pbar.update(5)
         pbar.close()
-        print(f'Object processed: {self.target} for {self.resolution} '
-              f'grism in {self.ob} with walltime {round(time.time() - tproc0, 1)} seconds.')
         return
 
     @staticmethod
@@ -430,7 +448,7 @@ class OB:
                                               df.pixel < self.pixhigh - 100))].copy()
         linfit = Poly.fit(df.pixel.values, df.wave.values, deg=1, full=True)[0]  # linear fit
         residual = linfit(df.pixel.values) - df.wave.values
-        thirdorder: Poly = Poly.fit(df.pixel.values, residual, deg=3, full=True)[0]
+        thirdorder = Poly.fit(df.pixel.values, residual, deg=3, full=True)[0]
         ax.plot(df.pixel, thirdorder(df.pixel.values), 'yx', label='Linear Residual 1')
         ax.plot(*thirdorder.linspace(), 'y--', label='3rd Order Fit 1')
         pcomb = linfit - thirdorder
@@ -1548,6 +1566,8 @@ if __name__ == '__main__':  # if called as script, run main module
     args = system_arguments()
     do_all = args.do_all
     do_repeat = args.repeat
+    if do_all and not do_repeat:
+        do_repeat = True
     dojsons = args.gen_jsons
     # config file
     config = Config(args.config_file)
