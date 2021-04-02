@@ -1267,6 +1267,12 @@ class Config:
     """
     Config file parameters for use in reduction
     """
+    rawpath, redpath, targetlist, head_actual, minpix, maxpix, \
+    stripewidth, cpix, \
+    minwave, maxwave, maxthread = '', '', '', '', 1, 2051, \
+                                  100, 250, \
+                                  5000, 10000, multiprocessing.cpu_count() // 2
+
     def __init__(self, conf_fname: str):
         """
         Create all parameters
@@ -1278,9 +1284,7 @@ class Config:
         """
         self.fname = conf_fname
         self.allparams = self.fopen()
-        self.rawpath, self.redpath, self.targetlist, self.head_actual, \
-        self.minpix, self.maxpix, self.stripewidth, self.cpix,\
-        self.minwave, self.maxwave, self.maxthread = self.getparams()
+        self.getparams()
         return
 
     def getparams(self):
@@ -1312,69 +1316,62 @@ class Config:
         maxthread: int
             Maximum number of threads to use in multiprocessing
         """
-        rawpath, redpath, targetlist, head_actual, minpix, maxpix,\
-        stripewidth, cpix,\
-        minwave, maxwave, maxthread = '', '', '', '', 1, 2051,\
-                                      100, 250,\
-                                      5000, 10000, multiprocessing.cpu_count() // 2
         for key in self.allparams:
             if key == 'rawpath':
-                rawpath = self.allparams[key]
-                if rawpath == '' and \
+                self.rawpath = self.allparams[key]
+                if self.rawpath == '' and \
                         np.any([not glob.glob(folder) for folder in ['arc', 'bias', 'flat', 'stds', 'object']]):
                     raise ValueError('Using default value for raw data path, it is empty')
             elif key == 'redpath':
-                redpath = self.allparams[key]
-                if redpath == '':
+                self.redpath = self.allparams[key]
+                if self.redpath == '':
                     warnings.warn('Using default value (current dir) for reduced data path')
             elif key == 'targetlist':
-                targetlist = self.allparams[key]
-                if targetlist == '':
+                self.targetlist = self.allparams[key]
+                if self.targetlist == '':
                     warnings.warn('No target list given, will default to header values')
             elif key == 'head_actual':
-                head_actual = self.allparams[key]
-                if head_actual == '' or len(head_actual.split('_')) != 2:
+                self.head_actual = self.allparams[key]
+                if self.head_actual == '' or len(self.head_actual.split('_')) != 2:
                     warnings.warn('No column names given in for targetlist to use or cannot split on "_"')
             elif key == 'minpix':
                 try:
-                    minpix = int(self.allparams[key])
+                    self.minpix = int(self.allparams[key])
                 except ValueError:
                     warnings.warn('Using default value for min pixel (1)')
             elif key == 'maxpix':
                 try:
-                    maxpix = int(self.allparams[key])
+                    self.maxpix = int(self.allparams[key])
                 except ValueError:
                     warnings.warn('Using default value for max pixel (2051)')
             elif key == 'stripewidth':
                 try:
-                    stripewidth = int(self.allparams[key])
+                    self.stripewidth = int(self.allparams[key])
                 except ValueError:
                     warnings.warn('Using default value for stripe width (100)')
             elif key == 'cpix':
                 try:
-                    cpix = int(self.allparams[key])
+                    self.cpix = int(self.allparams[key])
                 except ValueError:
                     warnings.warn('Using default value for central pixel (250)')
             elif key == 'minwave':
                 try:
-                    minwave = int(self.allparams[key])
+                    self.minwave = int(self.allparams[key])
                 except ValueError:
                     warnings.warn('Using default value for minimum wavelength (5000A)')
             elif key == 'maxwave':
                 try:
-                    maxwave = int(self.allparams[key])
+                    self.maxwave = int(self.allparams[key])
                 except ValueError:
                     warnings.warn('Using default value for maximum wavelength (10000A)')
             elif key == 'maxthread':
                 try:
-                    maxthread = int(self.allparams[key])
+                    self.maxthread = int(self.allparams[key])
                 except ValueError:
-                    warnings.warn(f'Using default value for max threads {maxthread}')
+                    warnings.warn(f'Using default value for max threads {self.maxthread}')
             else:
                 warnings.warn(f'Unknown key {key}')
-        return rawpath, redpath, targetlist, head_actual, minpix, maxpix,\
-            stripewidth, cpix,\
-            minwave, maxwave, maxthread
+        return
 
     def fopen(self):
         """
