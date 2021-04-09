@@ -45,26 +45,27 @@ Config : str
     Parses the config file for the required arguments: rawpath, redpath, targetlist, head_actual
      minpix, maxpix, stripewidth, cpix, minwave, maxwave, maxthread
 """
-import numpy as np  # general mathematics and array handling
-from numpy.polynomial.polynomial import Polynomial as Poly
 from astropy.io.fits import getdata, getheader
 from astropy.table import Table  # opening files as data tables
-from scipy.optimize import curve_fit
-from scipy.interpolate import UnivariateSpline as Spline3
 import matplotlib.pyplot as plt
 from matplotlib import rc, rcParams
 from matplotlib.colors import LinearSegmentedColormap, LogNorm
+from numba import njit
+import numpy as np  # general mathematics and array handling
+from numpy.polynomial.polynomial import Polynomial as Poly
 import pandas as pd
+from scipy.optimize import curve_fit
+from scipy.interpolate import UnivariateSpline as Spline3
 from tqdm import tqdm
 
 import argparse
 import glob  # equivalent to linux 'ls'
-import warnings  # used for suppressing an annoying warning message about runtime
+import json
 import multiprocessing  # used to overcome the inherent python GIL
+import os
 import time  # timing processing
 from typing import Tuple, Sequence  # used for type hinting
-import os
-import json
+import warnings  # used for suppressing an annoying warning message about runtime
 
 
 class OB:
@@ -88,10 +89,10 @@ class OB:
     figobj, axesobj, figstd, figobjarc, axesobjarc, figstdarc, axesstdarc, axesstd,\
         pixlow, pixhigh, indlow, indhigh, ptobias, master_bias, ptoflats,\
         master_flat, bpm, ptoobj, humidity, airmass, mjd, ptostds, ptoarcs,\
-        ftoabs, master_standard, ftoabs_error, standard_name, standard_residual,\
+        ftoabs, master_standard, ftoabs_error, standard_name, standard_residual, pbar,\
         cpix, aptleft, aptright, haveaperture, master_target, target, target_residual = None, None, None, None, None,\
     None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None,\
-    None, None, None, None, None, None, None, None, None, None, None
+    None, None, None, None, None, None, None, None, None, None, None, None
 
     def __init__(self, ptodata: str):
         """
@@ -121,7 +122,7 @@ class OB:
 
     def reduction(self, ptodata: str):
         # initialising
-        pbar = tqdm(total=100, desc=f'{self.resolution}/{self.prog}/{self.ob}')
+        self.pbar = tqdm(total=100, desc=f'{self.resolution}/{self.prog}/{self.ob}')
         self.figobj, self.axesobj = plt.subplots(4, 4, figsize=(16, 10), dpi=300)
         self.axesobj = self.axesobj.flatten()
         self.figstd, self.axesstd = plt.subplots(4, 4, figsize=(16, 10), dpi=300)
@@ -130,32 +131,32 @@ class OB:
         self.axesstd = self.axesstd.flatten()
         # pixel limits
         self.pixlow, self.pixhigh, self.indlow, self.indhigh = self.pixel_constraints()
-        pbar.update(5)
+        self.pbar.update(5)
         self.logger(f'Use pixels from {self.pixlow} to {self.pixhigh}')
         # bias
         self.ptobias = ptodata + '/bias/0*fits'  # path to biases
         self.logger(f'There are {len(glob.glob(self.ptobias))} bias files')
         self.master_bias = self.bias()  # creates the master bias file
-        pbar.update(5)
+        self.pbar.update(5)
         biasplot = self.axesobj[4].imshow(self.master_bias, cmap='BuPu', origin='lower', aspect='auto')
         plt.colorbar(biasplot, ax=self.axesobj[4])
         # flat
         self.ptoflats = ptodata + '/flat/0*fits'  # path to flats
         self.logger(f'There are {len(glob.glob(self.ptoflats))} flats files')
         self.master_flat = self.flat(self.master_bias)  # creates the master flat file
-        pbar.update(5)
+        self.pbar.update(5)
         flatplot = self.axesobj[5].imshow(self.master_flat, cmap='BuPu', origin='lower', aspect='auto')
         plt.colorbar(flatplot, ax=self.axesobj[5])
         # bad pixel mask
         self.bpm = self.bpm_applying(np.ones_like(self.master_flat))
-        pbar.update(5)
+        self.pbar.update(5)
         bpmplot = self.axesobj[6].imshow(self.bpm, cmap=ccd_bincmap, origin='lower', aspect='auto')
         plt.colorbar(bpmplot, ax=self.axesobj[6])
         # header info and further initialisation
         self.ptoobj = ptodata + '/object/0*fits'  # path to object
         self.logger(f'There are {len(glob.glob(self.ptoobj))} object files')
         self.humidity, self.airmass, self.mjd = self.hum_air()  # average humidity and airmass of object obs
-        pbar.update(5)
+        self.pbar.update(5)
         self.logger(f'Humidity {self.humidity}\nAirmass {self.airmass}\nMJD {self.mjd}')
         self.ptostds = ptodata + '/stds/0*scopy.fits'  # path to standard
         self.logger(f'There are {len(glob.glob(self.ptostds))} standards files')
@@ -167,19 +168,20 @@ class OB:
         self.ftoabs, self.master_standard, self.ftoabs_error, self.standard_name, \
         self.standard_residual, self.cpix, self.aptleft, self.aptright = self.standard()  # standard reduction
         self.haveaperture = True
-        pbar.update(35)
+        self.pbar.update(5)
         self.logger(f'Name of standard being used was {self.standard_name.upper()}')
         # object
         self.logger('The object is now being reduced:')
         self.master_target, self.target, self.target_residual = self.object()  # reduces target
-        pbar.update(30)
+        self.pbar.update(5)
         # writing files and creating plots
         self.logger(f'The target was {self.target}')
         self.fig_formatter()  # formats the plots (titles, labels)
+        self.pbar.update(5)
         self.writing()  # writes reduced spectra to files
-        pbar.update(5)
-        pbar.update(5)
-        pbar.close()
+        self.pbar.update(5)
+        self.pbar.close()
+        del self.pbar
         return
 
     @staticmethod
@@ -228,6 +230,7 @@ class OB:
         return xmin, xmax, xmin - 1, xmax - 1
 
     @staticmethod
+    @njit
     def bisub(data: np.ndarray, bias: np.ndarray) -> np.ndarray:
         """Bias subtract from each CCD given
 
@@ -521,6 +524,7 @@ class OB:
         return wave
 
     @staticmethod
+    @njit
     def gaussian(_x: np.ndarray, _amp: float, cen: float, wid: float):
         """
         Gaussian equation
@@ -580,6 +584,7 @@ class OB:
         return np.divide(data, flat, where=flat != 0)  # returns 0 on the bad pixel masks
 
     @staticmethod
+    @njit
     def back_subtract(data: float, back: float) -> float:
         """Subtracts the background from the extracted spectrum
 
@@ -598,6 +603,7 @@ class OB:
         return backsubbed
 
     @staticmethod
+    @njit
     def find_back(segment: np.ndarray) -> float:
         """
         Finds the background value using an iterative mode
@@ -739,6 +745,7 @@ class OB:
         return pixels, peaks, data, aptleft, aptcent, aptright, background, jdict
 
     @staticmethod
+    @njit
     def poisson(photon_count: np.ndarray) -> np.ndarray:
         """Returns the photon count error as Poisson noise
 
@@ -753,6 +760,7 @@ class OB:
         return np.sqrt(photon_count) / photon_count
 
     @staticmethod
+    @njit
     def calibrate_errorprop(f: np.ndarray, errs: np.ndarray, errv: np.ndarray, v: np.ndarray) -> np.ndarray:
         """Propagates the error from division
 
@@ -774,6 +782,7 @@ class OB:
         return np.sqrt(top / bottom)
 
     @staticmethod
+    @njit
     def confining_region(wave: np.ndarray, flux: np.ndarray,
                          error: np.ndarray, wave_check: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Confines the wave and flux arrays to the same regime as the wave_check limits
@@ -906,23 +915,27 @@ class OB:
         sname = sname.split('_')[-1].lower().replace('-', '')  # converting standard name from header to model name
         slitwidths = [self.get_header_info(f)[-1] for f in standard_list]
         self.logger(f'Standard has slit widths: {slitwidths}')
+        self.pbar.update(5)
         # stack raw data
         all_standards = np.stack([self.fopener(obj) for obj in standard_list])
         median_standard = self.med_stack(all_standards)  # median stack objects
         self.axesstd[0].imshow(median_standard, cmap='coolwarm', norm=imgnorm, origin='lower', aspect='auto')
         self.axesstd[0].set_title(f'Median Stack ({len(all_standards)} standard/s)')
+        self.pbar.update(5)
         # bias subtract
         all_standards = np.stack([self.bisub(std, self.master_bias) for std in all_standards])
         median_standard = self.med_stack(all_standards)  # median stack the bias subtracted standards
         stdcoord = self.get_pixcoord(median_standard)  # centre pixel
         self.logger(f'Central pixel for standard around {stdcoord + 1}')
         self.axesstd[1].imshow(median_standard, cmap='coolwarm', norm=imgnorm, origin='lower', aspect='auto')
+        self.pbar.update(5)
         # flat field
         flat_standard = self.flat_field(median_standard, self.master_flat)  # flat field the standard
         self.axesstd[2].imshow(flat_standard, cmap='coolwarm', norm=imgnorm, origin='lower', aspect='auto')
         # apply bad pixel mask
         fixed_standard = flat_standard
         self.axesstd[3].imshow(fixed_standard, cmap='coolwarm', norm=imgnorm, origin='lower', aspect='auto')
+        self.pbar.update(5)
         # extract spectra
         self.json_handler(sname, 'w', {})
         jdict = self.json_handler(sname, 'r')
@@ -947,6 +960,7 @@ class OB:
         error = self.poisson(photons)  # creating the errors
         self.axesstd[8].errorbar(pixel, photons + back, yerr=error, color='green')
         self.axesstd[8].plot(pixel, back, color='orange')
+        self.pbar.update(5)
         # wavelength calibrate
         wave = self.arc_solution(pixel, aptcent, self.ptoarcs)
         self.axesstd[9].errorbar(wave, photons, yerr=error)
@@ -959,6 +973,7 @@ class OB:
         # calibrate standard fluxes
         wave, flux, error, sname = self.calibrate_real(wave, photons, error, sname,
                                                        ftoabs, ftoabs_error)  # real units spectra
+        self.pbar.update(5)
         self.axesstd[11].errorbar(wave, flux, yerr=error)
         calib_standard = np.array((wave, flux, error))
         return ftoabs, calib_standard, ftoabs_error, sname, resid,\
@@ -1036,6 +1051,7 @@ class OB:
         median_object = self.med_stack(all_objects)  # median stack objects
         self.axesobj[0].imshow(median_object, cmap='coolwarm', norm=imgnorm, origin='lower', aspect='auto')
         self.axesobj[0].set_title(f'Median Stack ({len(all_objects)} object/s)')
+        self.pbar.update(5)
         # centre coordinate
         coordinate = self.get_pixcoord(median_object)  # find pixel coordinate
         self.logger(f'Central pixel for object around {coordinate + 1}')
@@ -1043,12 +1059,14 @@ class OB:
         all_objects = np.stack([self.bisub(obj, self.master_bias) for obj in all_objects])
         median_object = self.med_stack(all_objects)  # median stack bias subtracted objects
         self.axesobj[1].imshow(median_object, cmap='coolwarm', norm=imgnorm, origin='lower', aspect='auto')
+        self.pbar.update(5)
         # flat field
         flat_object = self.flat_field(median_object, self.master_flat)  # flat field the object
         self.axesobj[2].imshow(flat_object, cmap='coolwarm', norm=imgnorm, origin='lower', aspect='auto')
         # apply bad pixel mask
         fixed_object = flat_object
         self.axesobj[3].imshow(fixed_object, cmap='coolwarm', norm=imgnorm, origin='lower', aspect='auto')
+        self.pbar.update(5)
         # extract spectra
         self.json_handler(tname, 'w', {})
         jdict = self.json_handler(tname, 'r')
@@ -1073,12 +1091,14 @@ class OB:
         error = self.poisson(photons)  # creating the errors
         self.axesobj[8].errorbar(pixel, photons + back, yerr=error, color='green')
         self.axesobj[8].plot(pixel, back, color='orange')
+        self.pbar.update(5)
         # wavelength calibrate
         wave = self.arc_solution(pixel, aptcent, self.ptoarcs)
         self.axesobj[9].errorbar(wave, photons, yerr=error)
         # flux calibrate
         wave, flux, error, tname = self.calibrate_real(wave, photons, error, tname,
                                                        self.ftoabs, self.ftoabs_error)  # real units spectra
+        self.pbar.update(5)
         self.axesobj[10].errorbar(wave, flux, yerr=error)
         self.axesobj[13].errorbar(wave, self.ftoabs, yerr=self.ftoabs_error, color='red')
         calib_spectra = np.array((wave, flux, error))
@@ -1559,7 +1579,7 @@ if __name__ == '__main__':  # if called as script, run main module
                      'figure.figsize': [4, 3], 'figure.dpi': 144,
                      'xtick.top': True, 'ytick.right': True, 'legend.handletextpad': 0.5,
                      'xtick.minor.visible': True, 'ytick.minor.visible': True})
-    # system arguements
+    # system arguments
     args = system_arguments()
     do_all = args.do_all
     do_repeat = args.repeat
