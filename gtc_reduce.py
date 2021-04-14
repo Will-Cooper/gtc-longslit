@@ -50,7 +50,6 @@ from astropy.table import Table  # opening files as data tables
 import matplotlib.pyplot as plt
 from matplotlib import rc, rcParams
 from matplotlib.colors import LinearSegmentedColormap, LogNorm
-from numba import njit
 import numpy as np  # general mathematics and array handling
 from numpy.polynomial.polynomial import Polynomial as Poly
 import pandas as pd
@@ -230,7 +229,6 @@ class OB:
         return xmin, xmax, xmin - 1, xmax - 1
 
     @staticmethod
-    @njit
     def bisub(data: np.ndarray, bias: np.ndarray) -> np.ndarray:
         """Bias subtract from each CCD given
 
@@ -524,7 +522,6 @@ class OB:
         return wave
 
     @staticmethod
-    @njit
     def gaussian(_x: np.ndarray, _amp: float, cen: float, wid: float):
         """
         Gaussian equation
@@ -584,7 +581,6 @@ class OB:
         return np.divide(data, flat, where=flat != 0)  # returns 0 on the bad pixel masks
 
     @staticmethod
-    @njit
     def back_subtract(data: float, back: float) -> float:
         """Subtracts the background from the extracted spectrum
 
@@ -603,7 +599,6 @@ class OB:
         return backsubbed
 
     @staticmethod
-    @njit
     def find_back(segment: np.ndarray) -> float:
         """
         Finds the background value using an iterative mode
@@ -745,7 +740,6 @@ class OB:
         return pixels, peaks, data, aptleft, aptcent, aptright, background, jdict
 
     @staticmethod
-    @njit
     def poisson(photon_count: np.ndarray) -> np.ndarray:
         """Returns the photon count error as Poisson noise
 
@@ -760,7 +754,6 @@ class OB:
         return np.sqrt(photon_count) / photon_count
 
     @staticmethod
-    @njit
     def calibrate_errorprop(f: np.ndarray, errs: np.ndarray, errv: np.ndarray, v: np.ndarray) -> np.ndarray:
         """Propagates the error from division
 
@@ -782,7 +775,6 @@ class OB:
         return np.sqrt(top / bottom)
 
     @staticmethod
-    @njit
     def confining_region(wave: np.ndarray, flux: np.ndarray,
                          error: np.ndarray, wave_check: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Confines the wave and flux arrays to the same regime as the wave_check limits
