@@ -49,6 +49,7 @@ from astropy.io.fits import getdata, getheader
 from astropy.table import Table  # opening files as data tables
 import matplotlib.pyplot as plt
 from matplotlib import rc, rcParams
+from matplotlib import use as backend
 from matplotlib.colors import LinearSegmentedColormap, LogNorm
 import numpy as np  # general mathematics and array handling
 from numpy.polynomial.polynomial import Polynomial as Poly
@@ -58,6 +59,7 @@ from scipy.interpolate import UnivariateSpline as Spline3
 from tqdm import tqdm
 
 import argparse
+import cProfile
 import glob  # equivalent to linux 'ls'
 import json
 import multiprocessing  # used to overcome the inherent python GIL
@@ -1100,35 +1102,13 @@ class OB:
         """
         Writes the standard used and object to files
         """
-        tspec = Table(data=self.master_target.T)  # the actual target
+        np.savez_compressed(f'{config.redpath}/npdata/{self.ob}_{self.resolution}_{self.prog}_{self.target}',
+                            target=self.master_target.T, standard=self.master_standard.T,
+                            bias=self.master_bias, flat=self.master_flat,
+                            cutout=self.target_residual, cutoutstd=self.standard_residual,
+                            fluxcal=np.array((self.master_standard[0], self.ftoabs)).T)
         with open('reduced.log', 'a+') as f:  # add to log file that the target has been reduced
             f.write(f'{self.ob}_{self.resolution}_{self.prog}\n')
-        tspec.write(f'{config.redpath}/objects/{self.ob}_{self.resolution}_{self.prog}_{self.target}.txt',
-                    format='ascii.no_header', overwrite=True)
-        tstand = Table(data=self.master_standard.T)  # the standard from the same observing block as standard
-        tstand.write(f'{config.redpath}/standards/'
-                     f'{self.ob}_{self.resolution}_{self.prog}_{self.standard_name}.txt',
-                     format='ascii.no_header', overwrite=True)
-        tbias = Table(data=self.master_bias)
-        tbias.write(f'{config.redpath}/bias/'
-                    f'{self.ob}_{self.resolution}_{self.prog}.txt',
-                    format='ascii.no_header', overwrite=True)
-        tflat = Table(data=self.master_flat)
-        tflat.write(f'{config.redpath}/flat/'
-                    f'{self.ob}_{self.resolution}_{self.prog}.txt',
-                    format='ascii.no_header', overwrite=True)
-        tspec_resid = Table(data=self.target_residual)  # the cut out region around where the target spectra should be
-        tspec_resid.write(f'{config.redpath}/residuals/objects/'
-                          f'{self.ob}_{self.resolution}_{self.prog}_{self.target}.txt',
-                          format='ascii.no_header', overwrite=True)
-        tstand_resid = Table(data=self.standard_residual)  # the cut out region around where the standard spectra is
-        tstand_resid.write(f'{config.redpath}/residuals/standards/'
-                           f'{self.ob}_{self.resolution}_{self.prog}_{self.standard_name}.txt',
-                           format='ascii.no_header', overwrite=True)
-        tcalib = Table(data=(self.master_standard[0], self.ftoabs))  # the calibration function
-        tcalib.write(f'{config.redpath}/calib_funcs/'
-                     f'{self.ob}_{self.resolution}_{self.standard_name}_{self.prog}_{self.target}.txt',
-                     format='ascii.no_header', overwrite=True)
         return
 
     def fig_formatter(self):
@@ -1455,7 +1435,7 @@ def env_check():
         warnings.warn(f'Could not find {redpth}, attempting to create')
         os.mkdir(redpth)
     for folder in ('arcs', 'bias', 'calib_funcs', 'flat', 'standards',
-                   'jsons', 'log', 'objects', 'reduction',
+                   'jsons', 'log', 'objects', 'reduction', 'npdata',
                    'residuals', 'residuals/objects', 'residuals/standards'):
         if not glob.glob(f'{redpth}/{folder}'):
             warnings.warn(f'Trying to make folder in {redpth}')
@@ -1514,10 +1494,13 @@ def run_reduction(ob_list: list):
         avail_cores = config.maxthread or 1  # available cores to thread over
         if len(ob_list) < avail_cores:
             avail_cores = len(ob_list)
-        print(f'Threading over {avail_cores} core(s).')
-        pool = multiprocessing.Pool(processes=avail_cores)
-        pool.map(OB, ob_list)
-        pool.close()
+        if len(ob_list) > 1:
+            print(f'Threading over {avail_cores} core(s).')
+            pool = multiprocessing.Pool(processes=avail_cores)
+            pool.map(OB, ob_list)
+            pool.close()
+        else:
+            _ = OB(ob_list[0])
         print('Done with spectra.')
         tfin = (time.time() - t0) / 60
         print(f'Run took {tfin:.1f} minutes.')
@@ -1551,6 +1534,7 @@ def system_arguments():
     myargs.add_argument('-r', '--repeat', action='store_true', default=False, help='Re-do already reducted spectra?')
     myargs.add_argument('-c', '--config-file', help='The config file', required=True)
     myargs.add_argument('-j', '--gen-jsons', action='store_true', default=False, help='Create jsons for live plots?')
+    myargs.add_argument('-t', '--trace', action='store_true', default=False, help='Trace profile?')
     _args = myargs.parse_args()
     return _args
 
@@ -1558,6 +1542,7 @@ def system_arguments():
 if __name__ == '__main__':  # if called as script, run main module
     # global constants will go here
     # plotting
+    backend('agg')
     imgnorm = LogNorm(1, 65536)
     ccd_bincmap = LinearSegmentedColormap.from_list('bincmap', plt.cm.binary_r(np.linspace(0, 1, 2)), N=2)
     rc('text', usetex=True)
@@ -1575,10 +1560,14 @@ if __name__ == '__main__':  # if called as script, run main module
     args = system_arguments()
     do_all = args.do_all
     do_repeat = args.repeat
+    do_trace = args.trace
     if do_all and not do_repeat:
         do_repeat = True
     dojsons = args.gen_jsons
     # config file
     config = Config(args.config_file)
     # run the script
-    main()
+    if do_trace:
+        cProfile.run('main()')
+    else:
+        main()
