@@ -87,13 +87,13 @@ class OB:
     to create the flux calibration. This is then applied to the final object spectra.
     """
     # initialise class attributes (overrode by instance attributes)
-    figobj, axesobj, figstd, figobjarc, axesobjarc, figstdarc, axesstdarc, axesstd,\
-        pixlow, pixhigh, indlow, indhigh, ptobias, master_bias, ptoflats,\
+    figobj, axesobj, figstd, figobjarc, axesobjarctop, axesobjarcbot, figstdarc, axesstdarctop,\
+        axesstdarcbot, axesstd, pixlow, pixhigh, indlow, indhigh, ptobias, master_bias, ptoflats,\
         master_flat, bpm, ptoobj, humidity, airmass, mjd, ptostds, ptoarcs,\
         ftoabs, master_standard, ftoabs_error, standard_name, standard_residual, pbar,\
         cpix, aptleft, aptright, haveaperture, master_target, target, target_residual = None, None, None, None, None,\
     None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None,\
-    None, None, None, None, None, None, None, None, None, None, None, None
+    None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
     def __init__(self, ptodata: str):
         """
@@ -125,11 +125,15 @@ class OB:
         # initialising
         self.pbar = tqdm(total=100, desc=f'{self.resolution}/{self.prog}/{self.ob}')
         self.figobj, self.axesobj = plt.subplots(4, 4, figsize=(16, 10), dpi=300)
-        self.axesobj = self.axesobj.flatten()
+        self.axesobj: np.array(plt.Axes) = self.axesobj.flatten()
         self.figstd, self.axesstd = plt.subplots(4, 4, figsize=(16, 10), dpi=300)
-        self.figobjarc, self.axesobjarc = plt.subplots(figsize=(8, 5), dpi=300)
-        self.figstdarc, self.axesstdarc = plt.subplots(figsize=(8, 5), dpi=300)
-        self.axesstd = self.axesstd.flatten()
+        self.axesstd: np.array(plt.Axes) = self.axesstd.flatten()
+        self.figobjarc: plt.Figure = plt.figure(figsize=(8, 5), dpi=300)
+        self.figstdarc: plt.Figure = plt.figure(figsize=(8, 5), dpi=300)
+        self.axesobjarctop: plt.Axes = self.figobjarc.add_axes([0.1, 0.35, 0.8, 0.55])
+        self.axesobjarcbot: plt.Axes = self.figobjarc.add_axes([0.1, 0.1, 0.8, 0.25])
+        self.axesstdarctop: plt.Axes = self.figstdarc.add_axes([0.1, 0.35, 0.8, 0.55])
+        self.axesstdarcbot: plt.Axes = self.figstdarc.add_axes([0.1, 0.1, 0.8, 0.25])
         # pixel limits
         self.pixlow, self.pixhigh, self.indlow, self.indhigh = self.pixel_constraints()
         self.pbar.update(5)
@@ -428,7 +432,7 @@ class OB:
         pix_wave = pd.DataFrame({'pixel': wherepk, 'wave': np.sort(linewaves)})
         return pix_wave
 
-    def solution_fitter(self, df: pd.DataFrame, ax: plt.Axes) -> Poly:
+    def solution_fitter(self, df: pd.DataFrame, ax: Sequence[plt.Axes]) -> Poly:
         """
         Iteratively fits to arc solution
 
@@ -436,7 +440,7 @@ class OB:
         ----------
         df : pd.DataFrame
             The dataframe of pixel to wavelength
-        ax : plt.Axes
+        ax : Sequence[plt.Axes]
             The plot axes to put the residuals on
 
         Returns
@@ -444,6 +448,8 @@ class OB:
         pcomb: Poly
             The combined polynomial solution
         """
+        axtop, axbot = ax
+        cols = ['tab:' + i for i in ('cyan', 'blue', 'purple', 'pink', 'orange', 'red')]
         linfit = Poly.fit(df.pixel.values, df.wave.values, deg=1, full=True)[0]  # linear fit
         residual = linfit(df.pixel.values) - df.wave.values
         df = df[np.logical_and(np.abs(residual) < 100,
@@ -452,32 +458,45 @@ class OB:
         linfit = Poly.fit(df.pixel.values, df.wave.values, deg=1, full=True)[0]  # linear fit
         residual = linfit(df.pixel.values) - df.wave.values
         thirdorder = Poly.fit(df.pixel.values, residual, deg=3, full=True)[0]
-        ax.plot(df.pixel, thirdorder(df.pixel.values), 'yx', label='Linear Residual 1')
-        ax.plot(*thirdorder.linspace(), 'y--', label='3rd Order Fit 1')
+        axtop.plot(df.pixel, thirdorder(df.pixel.values), color=cols[0], marker='x', lw=0)
+        axtop.plot(*thirdorder.linspace(), color=cols[0], ls='--', label='Iteration 1')
         pcomb = linfit - thirdorder
         residual = pcomb(df.pixel.values) - df.wave
-        ax.plot(df.pixel, residual, 'mx', label='Combined Residual 1')
+        df['residual'] = residual
+        dfcut = df[np.abs(df.residual) < 2].copy()
+        axbot.plot(dfcut.pixel, dfcut.residual, color=cols[0], marker='x', lw=0)
         iqr = np.subtract(*np.quantile(residual, [.75, .25]))
-        ax.fill_between(df.pixel.values, -2*iqr, 2*iqr, color='cyan', label='2X IQR 1', alpha=0.5)
-        df = df[np.logical_and(np.abs(residual) < 2 * iqr,
+        # axtop.plot(df.pixel, df.residual, 'mx', label='Combined Residual 1')
+        # axtop.fill_between(df.pixel.values, -2*iqr, 2*iqr, color='cyan', label='2X IQR 1', alpha=0.5)
+        df = df[np.logical_and(np.abs(df.residual) < 2 * iqr,
                                np.logical_and(df.pixel > self.pixlow + 100,
                                               df.pixel < self.pixhigh - 100))].copy()
-        residual = residual[np.abs(residual) < 2 * iqr]
-        weights = np.divide(1, np.power(residual, 3), where=residual != 0)
-        # do again from start, now with weights and some bad data removed
-        linfit = Poly.fit(df.pixel.values, df.wave.values, deg=1, w=weights, full=True)[0]  # linear fit
-        residual = linfit(df.pixel.values) - df.wave.values
-        thirdorder = Poly.fit(df.pixel.values, residual, deg=3, w=weights, full=True)[0]
-        ax.plot(df.pixel, thirdorder(df.pixel.values), 'rx', label='Linear Residual 2')
-        ax.plot(*thirdorder.linspace(), 'r--', label='3rd Order Fit 2')
-        pcomb = linfit - thirdorder
-        residual = pcomb(df.pixel.values) - df.wave
+        badn = len(np.abs(residual) > 2 * iqr)
+        i = 1
+        while badn and i < len(cols):
+            # do again from start, now with some bad data removed
+            i += 1
+            linfit = Poly.fit(df.pixel.values, df.wave.values, deg=1, full=True)[0]  # linear fit
+            residual = linfit(df.pixel.values) - df.wave.values
+            thirdorder = Poly.fit(df.pixel.values, residual, deg=3, full=True)[0]
+            axtop.plot(df.pixel, thirdorder(df.pixel.values), color=cols[i - 1], lw=0, marker='x')
+            axtop.plot(*thirdorder.linspace(), color=cols[i - 1], ls='--', label=f'Iteration {i}')
+            pcomb = linfit - thirdorder
+            residual = pcomb(df.pixel.values) - df.wave
+            df['residual'] = residual
+            dfcut = df[np.abs(df.residual) < 2].copy()
+            axbot.plot(dfcut.pixel, dfcut.residual, color=cols[i - 1], marker='x', lw=0)
+            iqr = np.subtract(*np.quantile(residual, [.75, .25]))
+            badn = len(residual[np.abs(residual[np.logical_and(df.pixel > self.pixlow + 100,
+                                                               df.pixel < self.pixhigh - 100)]) > 2 * iqr])
+            # axtop.fill_between(df.pixel.values, -2 * iqr, 2 * iqr, label=f'2X IQR {i}', alpha=0.25)
+            # axtop.scatter(df.pixel, residual, marker='x', label=f'Combined Residual {i}')
+            df = df[np.logical_and(np.abs(df.residual) < 2 * iqr,
+                                   np.logical_and(df.pixel > self.pixlow + 100,
+                                                  df.pixel < self.pixhigh - 100))].copy()
         rmsd = np.sqrt(np.sum(np.square(residual)) / residual.size)
-        iqr = np.subtract(*np.quantile(residual, [.75, .25]))
-        ax.fill_between(df.pixel.values, -2 * iqr, 2 * iqr, color='blue', label='2X IQR 2', alpha=0.25)
         rmsdiqr = rmsd / iqr
         self.logger(f'Arc solution RMSDIQR {rmsdiqr}')
-        ax.plot(df.pixel, residual, 'bx', label='Combined Residual 2')
         return pcomb
 
     def arc_solution(self, pixel: np.ndarray, cpix: np.ndarray, ptoarcs: str) -> np.ndarray:
@@ -501,10 +520,10 @@ class OB:
         # TODO: make arc solution work for R300R, and improve residuals
         if self.haveaperture:
             ax = self.axesobj[12]
-            ax2 = self.axesobjarc
+            ax2 = self.axesobjarctop, self.axesobjarcbot
         else:
             ax = self.axesstd[12]
-            ax2 = self.axesstdarc
+            ax2 = self.axesstdarctop, self.axesstdarcbot
         arcfiles = glob.glob(ptoarcs)
         all_pix_wave = pd.DataFrame(columns=('pixel', 'wave'))
         for i, arc in enumerate(arcfiles):
@@ -1142,12 +1161,16 @@ class OB:
         self.axesstd[10].set_xlabel(r'$\lambda\ [\AA]$')
         self.axesstd[10].set_ylabel('Counts')
         self.axesstd[10].set_yscale('linear')
-        for ax in (self.axesstdarc, self.axesstd[12], self.axesobjarc, self.axesobj[12]):
+        for ax in (self.axesstdarctop, self.axesstdarcbot, self.axesstd[12],
+                   self.axesobjarctop, self.axesobjarcbot, self.axesobj[12]):
             ax.set_xlabel('Y Pixel [pix]')
-            # ax.set_ylim(0, 65535)
-        for ax in (self.axesobjarc, self.axesstdarc):
+        for ax in (self.axesobjarctop, self.axesstdarctop):
             ax.set_ylabel(r'$\Delta \lambda\ [\AA]$')
-            ax.legend()
+            ax.legend(ncol=6)
+        for ax in (self.axesobjarcbot, self.axesstdarcbot):
+            ax.set_ylabel(r'$\Delta \lambda\ [\AA]$')
+            ax.set_ylim(-2.5, 2.5)
+            ax.set_yticks([-2, 0, 2])
         for ax in (self.axesstd[12], self.axesobj[12]):
             ax.set_ylabel(r'$\lambda\ [\AA]$')
         self.axesobj[13].set_title('Calibration Function')
