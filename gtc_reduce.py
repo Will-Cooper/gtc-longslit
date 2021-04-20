@@ -46,7 +46,8 @@ Config : str
      minpix, maxpix, stripewidth, cpix, minwave, maxwave, maxthread
 """
 from astropy.io.fits import getdata, getheader
-from astropy.table import Table  # opening files as data tables
+from astropy.table import Table, QTable  # opening files as data tables
+import astropy.units as u
 import matplotlib.pyplot as plt
 from matplotlib import rc, rcParams
 from matplotlib import use as backend
@@ -56,6 +57,8 @@ from numpy.polynomial.polynomial import Polynomial as Poly
 import pandas as pd
 from scipy.optimize import curve_fit
 from scipy.interpolate import UnivariateSpline as Spline3
+from specutils import Spectrum1D, conf
+from specutils.fitting import find_lines_derivative
 from tqdm import tqdm
 
 import argparse
@@ -65,6 +68,7 @@ import json
 import multiprocessing  # used to overcome the inherent python GIL
 import os
 import time  # timing processing
+from traceback import print_tb
 from typing import Tuple, Sequence  # used for type hinting
 import warnings  # used for suppressing an annoying warning message about runtime
 
@@ -86,7 +90,7 @@ class OB:
     The extracted, wavelength calibrated standard is divided by its corresponding model spectra (F_lambda)
     to create the flux calibration. This is then applied to the final object spectra.
     """
-    # initialise class attributes (overrode by instance attributes)
+    # initialise class attributes (overridden by instance attributes)
     figobj, axesobj, figstd, figobjarc, axesobjarctop, axesobjarcbot, figstdarc, axesstdarctop,\
         axesstdarcbot, axesstd, pixlow, pixhigh, indlow, indhigh, ptobias, master_bias, ptoflats,\
         master_flat, bpm, ptoobj, humidity, airmass, mjd, ptostds, ptoarcs,\
@@ -112,9 +116,9 @@ class OB:
         self.logger(f'Resolution {self.resolution}\nProgramme {self.prog}\nObserving block {self.ob}', w=True)
         try:
             self.reduction(ptodata)
-        except ValueError as e:
+        except (ValueError, AttributeError) as e:
             print(f'Could not complete reduction of {self.ob} {self.prog} {self.resolution}')
-            print(e)
+            print_tb(e.__traceback__)
             return
         else:
             print(f'Object processed: {self.target} for {self.resolution} '
@@ -383,7 +387,65 @@ class OB:
         return self.normalise(bpm_flat)  # normalised flat
 
     @staticmethod
-    def identify(pixel: np.ndarray, dataline: np.ndarray, lamp: str) -> pd.DataFrame:
+    def findlines(linelist: pd.DataFrame, pixlist: pd.DataFrame):
+        """
+        Find the lab lines (Angstroms) corresponding to a given arc line (pixel)
+
+        Parameters
+        ----------
+        linelist: pd.DataFrame
+            The dataframe containing the known laboratory lines and their relative intensities
+        pixlist: pd.DataFrame
+            The dataframe containing the line pixels, their strengths and an initial wavelength guess
+
+        Returns
+        -------
+        pixlist: pd.DataFrame
+            The dataframe with line pixels plus the array of wavelengths corresponding to a given arc line
+        """
+        initwave: np.ndarray = pixlist['initwave']
+        linewaves: np.ndarray = np.zeros_like(initwave)
+        pixlist.sort_values('strength', ascending=False, inplace=True, ignore_index=True)
+        initlist: pd.DataFrame = linelist.copy()
+        for i, row in pixlist.iterrows():
+            i: int = i
+            wave: float = row['initwave']
+            linelist['wavediff']: QTable.Column = np.abs(linelist.wave - wave)
+            closest: pd.DataFrame = linelist.sort_values('wavediff')
+            closest: pd.DataFrame = closest[:2]
+            idx: int = closest.intens.idxmax()
+            linewaves[i] = linelist.iloc[idx].wave
+            linelist.drop(idx, inplace=True)
+            linelist.reset_index(drop=True, inplace=True)
+        pixlist['wave']: pd.Series = linewaves
+        pixlist.sort_values('line_center', inplace=True, ignore_index=True)
+        initlist.sort_values('wave', inplace=True, ignore_index=True)
+        linfit: Poly = Poly.fit(pixlist.line_center, pixlist.wave, deg=1, full=True)[0]
+        residual: np.ndarray = np.abs(linfit(pixlist.line_center) - pixlist.wave)
+        pixlist['residual']: pd.Series = residual
+        pixlist.reset_index(inplace=True, drop=True)
+        cutpixlist: pd.DataFrame = pixlist.copy()
+        for i, row in pixlist.iterrows():
+            i: int = i
+            resid: float = row['residual']
+            wave: float = row['wave']
+            cutlablist: pd.DataFrame = initlist[np.abs(initlist.wave - wave) < 5 * resid].copy()
+            for j, labrow in cutlablist.iterrows():
+                newwave: float = labrow['wave']
+                cutpixlist.loc[i, 'wave'] = newwave
+                linfit: Poly = Poly.fit(cutpixlist.line_center, cutpixlist.wave, deg=1, full=True)[0]
+                residual: np.ndarray = np.abs(linfit(cutpixlist.line_center) - cutpixlist.wave)
+                newresid: float = residual[i]
+                if newresid < resid:
+                    resid: float = newresid
+                    wave: float = newwave
+                    cutpixlist.loc[i, 'residual'] = resid
+                else:
+                    cutpixlist.loc[i, 'wave'] = wave
+            pixlist: pd.DataFrame = cutpixlist.copy()
+        return pixlist
+
+    def identify(self, pixel: np.ndarray, dataline: np.ndarray, lamp: str) -> pd.DataFrame:
         """
         Identifies the lines in an arc and compares to line list
 
@@ -401,35 +463,39 @@ class OB:
         pix_wave: pd.DataFrame
             A dataframe of columns pixel to wavelength
         """
-        linelist = pd.read_csv(f'lablinelist/{lamp}I.csv')
-        linelist = linelist[np.logical_and(linelist.wave > config.minwave, linelist.wave < config.maxwave)].copy()
-        linelist.sort_values('intens', ascending=False, inplace=True, ignore_index=True)  # sort down by intensity
-        xhigh = np.linspace(np.min(pixel), np.max(pixel), pixel.size * 100)
-        sp = Spline3(pixel, dataline)
-        spfit = sp(xhigh)
-        cpeak, wherepk, increasing = 0, np.empty(0), True
-        comp = np.mean(spfit) + np.std(spfit)
-        pntcomp = np.mean(spfit)
-        for i, pnt in enumerate(spfit):
-            i = xhigh[i]
-            if pnt > pntcomp:
-                increasing = True
-            else:
-                if pntcomp > comp and increasing:
-                    if not len(wherepk) or i - wherepk[-1] > 3:  # ignore blended
-                        wherepk = np.append(wherepk, i)
-                        cpeak += 1
-                increasing = False
-            pntcomp = pnt
-
-        linewaves = np.empty(0)
-        for i, row in linelist.iterrows():
-            if len(linewaves) == cpeak:
-                break
-            if not linewaves.size or np.all(np.abs(np.subtract(linewaves, row.wave)) > 5):  # ignore blended
-                linewaves = np.append(linewaves, row.wave)
-
-        pix_wave = pd.DataFrame({'pixel': wherepk, 'wave': np.sort(linewaves)})
+        lablines: pd.DataFrame = pd.read_csv(f'lablinelist/{lamp.lower()}I.csv')
+        lablines: pd.DataFrame = lablines[np.logical_and(lablines.wave > config.minwave,
+                                                         lablines.wave < config.maxwave)].copy()
+        lablines.sort_values('intens', ascending=False, inplace=True, ignore_index=True)
+        yinit: np.ndarray = np.linspace(config.minwave, config.maxwave, len(pixel))
+        linfit_init: Poly = Poly.fit(pixel, yinit, deg=1, full=True)[0]
+        xhigh: np.ndarray = np.linspace(pixel.min(), pixel.max(), len(pixel) * 10)
+        spline = Spline3(pixel, dataline)
+        spfit: np.ndarray = spline(xhigh)
+        spectrum = Spectrum1D(spectral_axis=xhigh * u.pixel, flux=spfit * u.count)
+        comp: float = np.mean(spectrum.flux) + np.std(spectrum.flux)
+        lines: QTable = find_lines_derivative(spectrum, comp)
+        if len(lines) > len(lablines):
+            comp += np.std(spectrum.flux)
+        elif len(lines) < 10:
+            comp -= np.std(spectrum.flux) * 0.5
+        lines: QTable = find_lines_derivative(spectrum, comp)
+        lines['line_center'] /= u.pixel
+        lines['strength']: QTable.Column = spline(lines['line_center'])
+        lines['initwave']: QTable.Column = linfit_init(lines['line_center'])
+        keep: list = []
+        linesdf: pd.DataFrame = lines.to_pandas()
+        for j, row in linesdf.iterrows():
+            cutdf: pd.DataFrame = linesdf[np.logical_and(linesdf.line_center > row.line_center - 5,
+                                                         linesdf.line_center < row.line_center + 5)].copy()
+            idx: int = cutdf.strength.idxmax()
+            keep.append(idx)
+        keep = list(set(keep))
+        linesdf: pd.DataFrame = linesdf.iloc[keep].copy()
+        linesdf.reset_index(drop=True, inplace=True)
+        linesdf: pd.DataFrame = self.findlines(lablines.copy(), linesdf.copy())
+        pix_wave = pd.DataFrame({'pixel': linesdf.line_center, 'wave': linesdf.wave})
+        pix_wave.sort_values('pixel', inplace=True, ignore_index=True)
         return pix_wave
 
     def solution_fitter(self, df: pd.DataFrame, ax: Sequence[plt.Axes]) -> Poly:
@@ -449,53 +515,42 @@ class OB:
             The combined polynomial solution
         """
         axtop, axbot = ax
-        cols = ['tab:' + i for i in ('cyan', 'blue', 'purple', 'pink', 'orange', 'red')]
-        linfit = Poly.fit(df.pixel.values, df.wave.values, deg=1, full=True)[0]  # linear fit
-        residual = linfit(df.pixel.values) - df.wave.values
-        df = df[np.logical_and(np.abs(residual) < 100,
-                               np.logical_and(df.pixel > self.pixlow + 100,
-                                              df.pixel < self.pixhigh - 100))].copy()
-        linfit = Poly.fit(df.pixel.values, df.wave.values, deg=1, full=True)[0]  # linear fit
-        residual = linfit(df.pixel.values) - df.wave.values
-        thirdorder = Poly.fit(df.pixel.values, residual, deg=3, full=True)[0]
-        axtop.plot(df.pixel, thirdorder(df.pixel.values), color=cols[0], marker='x', lw=0)
-        axtop.plot(*thirdorder.linspace(), color=cols[0], ls='--', label='Iteration 1')
-        pcomb = linfit - thirdorder
-        residual = pcomb(df.pixel.values) - df.wave
-        df['residual'] = residual
-        dfcut = df[np.abs(df.residual) < 2].copy()
-        axbot.plot(dfcut.pixel, dfcut.residual, color=cols[0], marker='x', lw=0)
-        iqr = np.subtract(*np.quantile(residual, [.75, .25]))
-        # axtop.plot(df.pixel, df.residual, 'mx', label='Combined Residual 1')
-        # axtop.fill_between(df.pixel.values, -2*iqr, 2*iqr, color='cyan', label='2X IQR 1', alpha=0.5)
-        df = df[np.logical_and(np.abs(df.residual) < 2 * iqr,
-                               np.logical_and(df.pixel > self.pixlow + 100,
-                                              df.pixel < self.pixhigh - 100))].copy()
-        badn = len(np.abs(residual) > 2 * iqr)
-        i = 1
-        while badn and i < len(cols):
+        axtop: plt.Axes = axtop
+        axbot: plt.Axes = axbot
+        cols: list = ['tab:' + i for i in ('cyan', 'blue', 'purple', 'pink', 'orange', 'red')]
+        i: int = 0
+        residual: np.ndarray = None
+        pcomb: Poly = None
+        iqr: np.ndarray = None
+        while i < len(cols):
             # do again from start, now with some bad data removed
-            i += 1
-            linfit = Poly.fit(df.pixel.values, df.wave.values, deg=1, full=True)[0]  # linear fit
-            residual = linfit(df.pixel.values) - df.wave.values
-            thirdorder = Poly.fit(df.pixel.values, residual, deg=3, full=True)[0]
-            axtop.plot(df.pixel, thirdorder(df.pixel.values), color=cols[i - 1], lw=0, marker='x')
-            axtop.plot(*thirdorder.linspace(), color=cols[i - 1], ls='--', label=f'Iteration {i}')
-            pcomb = linfit - thirdorder
-            residual = pcomb(df.pixel.values) - df.wave
+            linfit: Poly = Poly.fit(df.pixel.values, df.wave.values, deg=1, full=True)[0]  # linear fit
+            residual: np.ndarray = linfit(df.pixel.values) - df.wave.values
+            # weights: np.ndarray = np.divide(1, np.square(np.std(residual)) * residual)
+            weights: np.ndarray = np.divide(1, np.divide(np.abs(residual), np.mean(np.abs(residual))))
+            # weights = np.ones_like(residual)
+            thirdorder: Poly = Poly.fit(df.pixel.values, residual, deg=3, w=weights, full=True)[0]
+            axtop.plot(df.pixel, residual, color=cols[i], lw=0, marker='x')
+            axtop.plot(*thirdorder.linspace(), color=cols[i], ls='--', label=f'Iteration {i + 1}')
+            pcomb: Poly = linfit - thirdorder
+            residual: np.ndarray = thirdorder(df.pixel.values) - residual
             df['residual'] = residual
-            dfcut = df[np.abs(df.residual) < 2].copy()
-            axbot.plot(dfcut.pixel, dfcut.residual, color=cols[i - 1], marker='x', lw=0)
-            iqr = np.subtract(*np.quantile(residual, [.75, .25]))
-            badn = len(residual[np.abs(residual[np.logical_and(df.pixel > self.pixlow + 100,
-                                                               df.pixel < self.pixhigh - 100)]) > 2 * iqr])
-            # axtop.fill_between(df.pixel.values, -2 * iqr, 2 * iqr, label=f'2X IQR {i}', alpha=0.25)
-            # axtop.scatter(df.pixel, residual, marker='x', label=f'Combined Residual {i}')
-            df = df[np.logical_and(np.abs(df.residual) < 2 * iqr,
-                                   np.logical_and(df.pixel > self.pixlow + 100,
-                                                  df.pixel < self.pixhigh - 100))].copy()
-        rmsd = np.sqrt(np.sum(np.square(residual)) / residual.size)
-        rmsdiqr = rmsd / iqr
+            dfcut: pd.DataFrame = df[np.abs(df.residual) < 2].copy()
+            axbot.plot(dfcut.pixel, dfcut.residual, color=cols[i], marker='x', lw=0)
+            iqr: np.ndarray = np.subtract(*np.quantile(residual, [.75, .25]))
+            std: float = np.std(residual)
+            comp: float = -1.5 * i / 5 + 2  # values from 2 to 0.5
+            boolselect: np.ndarray = np.logical_and(np.abs(residual) > comp * std,  # bad source
+                                                    np.logical_and(df.pixel > self.pixlow + 100,  # edge
+                                                                   df.pixel < self.pixhigh - 100))  # edge
+            _df: pd.DataFrame = df[np.logical_not(boolselect)].copy()
+            if len(_df) >= 10:
+                df: pd.DataFrame = _df.copy()
+            else:
+                break
+            i += 1
+        rmsd: float = np.sqrt(np.sum(np.square(residual)) / len(residual))
+        rmsdiqr: float = rmsd / iqr
         self.logger(f'Arc solution RMSDIQR {rmsdiqr}')
         return pcomb
 
@@ -529,7 +584,7 @@ class OB:
         for i, arc in enumerate(arcfiles):
             arcdata = getdata(arc, ext=2)  # extract whole arc
             arcdata = np.subtract(arcdata, self.master_bias)  # bias subtract
-            arcdata = np.divide(arcdata, self.master_flat, where=self.master_flat != 0)  # flat field
+            arcdata = np.divide(arcdata, self.master_flat, where=np.logical_not(np.isclose(self.master_flat, 0)))
             arcdata = arcdata[self.indlow: self.indhigh]
             arccut = arcdata[np.arange(len(arcdata)), cpix.astype(int)].flatten()  # just extraction pixel
             lamp = getheader(arc, ext=0)['OBJECT'].split('_')[-1].lower()
@@ -1134,6 +1189,8 @@ class OB:
         """
         Formats the produced reduction figures
         """
+        self.axesobj: Sequence[plt.Axes] = self.axesobj
+        self.axesstd: Sequence[plt.Axes] = self.axesstd
         for axes in (self.axesobj, self.axesstd):
             axes[1].set_title('Bias Subtracted')
             axes[2].set_title('Flat Fielded')
@@ -1167,9 +1224,11 @@ class OB:
         for ax in (self.axesobjarctop, self.axesstdarctop):
             ax.set_ylabel(r'$\Delta \lambda\ [\AA]$')
             ax.legend(ncol=6)
+            ax.set_xlim(np.floor(config.minpix / 100) * 100, np.ceil(config.maxpix / 100) * 100)
         for ax in (self.axesobjarcbot, self.axesstdarcbot):
             ax.set_ylabel(r'$\Delta \lambda\ [\AA]$')
             ax.set_ylim(-2.5, 2.5)
+            ax.set_xlim(np.floor(config.minpix / 100) * 100, np.ceil(config.maxpix / 100) * 100)
             ax.set_yticks([-2, 0, 2])
         for ax in (self.axesstd[12], self.axesobj[12]):
             ax.set_ylabel(r'$\lambda\ [\AA]$')
@@ -1565,6 +1624,7 @@ def system_arguments():
 if __name__ == '__main__':  # if called as script, run main module
     # global constants will go here
     # plotting
+    conf.do_continuum_function_check = False
     backend('agg')
     imgnorm = LogNorm(1, 65536)
     ccd_bincmap = LinearSegmentedColormap.from_list('bincmap', plt.cm.binary_r(np.linspace(0, 1, 2)), N=2)
