@@ -37,6 +37,10 @@ maxthread : int
     The number of threads to use multiprocessing on
 initsolution : str
     The filepath to the initial wavelength solution text file, with columns (wave, pixel)
+tracelinestart : int
+    The pixel to start the trace solution from, within which the spectra should not diverge by more than 11 pixels
+extractmethod : str
+    'simple' or 'optimal' as extraction methods
 
 Required file:
     * <name>.config  -- file containing config arguments, see example
@@ -53,7 +57,7 @@ Config : str
 """
 from astropy.io.fits import getdata, getheader
 from astropy.modeling import models
-from astropy.table import Table, QTable  # opening files as data tables
+from astropy.table import Table  # opening files as data tables
 import astropy.units as u
 import matplotlib.pyplot as plt
 from matplotlib import rc, rcParams
@@ -66,7 +70,7 @@ import pandas as pd
 from scipy.optimize import curve_fit
 from scipy.interpolate import UnivariateSpline as Spline3
 from specutils import Spectrum1D, conf
-from specutils.fitting import find_lines_derivative, fit_lines
+from specutils.fitting import fit_lines
 from tqdm import tqdm
 
 import argparse
@@ -137,6 +141,9 @@ class OB:
     target: str = ''
     target_residual: np.ndarray = np.empty(0)
     wave_soln: Poly = None
+    gain: float = 1
+    tracelinestart: int = 1287
+    extractmethod: str = 'simple'
 
     def __init__(self, ptodata: str):
         """
@@ -182,6 +189,7 @@ class OB:
         # pixel limits
         self.pixlow, self.pixhigh, self.indlow, self.indhigh = self.pixel_constraints()
         self.minspat, self.maxspat = self.spatial_constraints()
+        self.tracelinestart = config.tracelinestart - self.pixlow - 1
         self.pbar.update(5)
         self.logger(f'Use pixels from {self.pixlow} to {self.pixhigh}')
         # bad pixel mask
@@ -434,7 +442,8 @@ class OB:
         dtrimmed = data[self.indlow: self.indhigh, low: high]
         return dtrimmed
 
-    def normalise(self, data: np.ndarray) -> np.ndarray:
+    @staticmethod
+    def normalise(data: np.ndarray) -> np.ndarray:
         """Normalises to the mean value of array
 
         Take the median value of the approximate cut-out of the spectra to normalise by
@@ -444,8 +453,7 @@ class OB:
         data : np.ndarray
             The full CCD of the median flat
         """
-        dtrimmed = self.region_trim(data)
-        return np.divide(data, np.median(dtrimmed))
+        return np.divide(data, np.median(data))
 
     def flat(self, bias: np.ndarray) -> np.ndarray:
         """Creates master flat
@@ -466,45 +474,7 @@ class OB:
         return self.normalise(bpm_flat)  # normalised flat
 
     @staticmethod
-    def findlines(linelist: pd.DataFrame, pixlist: pd.DataFrame, spectrarc: Spectrum1D, initfit: Poly):
-        """
-        Find the lab lines (Angstroms) corresponding to a given arc line (pixel)
-
-        Parameters
-        ----------
-        linelist: pd.DataFrame
-            The dataframe containing the known laboratory lines and their relative intensities
-        pixlist: pd.DataFrame
-            The dataframe containing the line pixels, their strengths and an initial wavelength guess
-        spectrarc: Spectrum1D
-            The spectrum object for the arc
-        initfit: Polynomial
-            The initial wavelength solution
-
-        Returns
-        -------
-        pixlist: pd.DataFrame
-            The dataframe with line pixels plus the array of wavelengths corresponding to a given arc line
-        """
-        linelist.sort_values('wave', inplace=True, ignore_index=True)
-        pixlist.sort_values('line_center', inplace=True, ignore_index=True)
-        fitlines = np.zeros_like(pixlist.line_center, dtype=float)
-        initwave = np.zeros_like(fitlines)
-        for i, line in pixlist.iterrows():
-            g_init = models.Gaussian1D(amplitude=line.strength * u.count,
-                                       mean=line.line_center * u.pixel,
-                                       stddev=1 * u.pixel)
-            g_fit: models.Gaussian1D = fit_lines(spectrarc, g_init, window=4 * u.pixel)
-            fitlines[i] = g_fit.mean.value
-            initwave[i] = initfit(g_fit.mean.value)
-        pixlist.line_center = fitlines
-        pixlist['initwave'] = initwave
-        diffs = np.array([np.abs(pixlist.initwave - labwave) for labwave in linelist.wave])
-        idx = np.argmin(diffs, axis=0)
-        pixlist['wave'] = linelist.wave[idx].values
-        return pixlist
-
-    def identify(self, pixel: np.ndarray, dataline: np.ndarray, lamp: str, usegiven: bool = False) -> pd.DataFrame:
+    def identify(pixel: np.ndarray, dataline: np.ndarray, lamp: str) -> pd.DataFrame:
         """
         Identifies the lines in an arc and compares to line list
 
@@ -516,29 +486,22 @@ class OB:
             The 1D array of the arc to have lines identified in
         lamp: str
             The object keyword in the header for which lamp is being checked
-        usegiven: bool
-            Switch whether to use given wave solution
 
         Returns
         -------
         pix_wave: pd.DataFrame
             A dataframe of columns pixel to wavelength
         """
-        lablines: pd.DataFrame = pd.read_csv(f'lablinelist/{lamp.lower()}I.csv')
-        lablines: pd.DataFrame = lablines[np.logical_and(lablines.wave > config.minwave,
-                                                         lablines.wave < config.maxwave)].copy()
-        lablines.sort_values('intens', ascending=False, inplace=True, ignore_index=True)
-        initsolution: np.ndarray = np.loadtxt(config.initsolution, unpack=True, usecols=(0, 1))
-        initfit: Poly = Poly.fit(initsolution[1], initsolution[0], deg=3, full=True)[0]
+        initsolution: pd.DataFrame = pd.read_csv(config.initsolution)
+        initsolution: pd.DataFrame = initsolution[[i in lamp for i in initsolution.line]].copy()
         spline = Spline3(pixel, dataline)
-        strengths = [np.max([i for i in spline(np.linspace(val - 2, val + 2))]) for val in initsolution[1]]
-        initdf: pd.DataFrame = pd.DataFrame({'pixel': initsolution[1], 'wave': initsolution[0],
-                                             'strength': strengths})
-        xhigh = np.linspace(pixel.min(), pixel.max(), len(pixel) * 10)
+        strengths = [np.max([i for i in spline(np.linspace(val - 2, val + 2))]) for val in initsolution.pixel]
+        initsolution['strength'] = strengths
+        xhigh = np.linspace(pixel.min(), pixel.max(), len(pixel) * 100)
         yfit = spline(xhigh)
         spectrum = Spectrum1D(spectral_axis=xhigh * u.pixel, flux=yfit * u.count)
         g_inits = []
-        for i, val in initdf.iterrows():
+        for i, val in initsolution.iterrows():
             g_inits.append(models.Gaussian1D(amplitude=val.strength * u.count,
                                              mean=val.pixel * u.pixel,
                                              stddev=1.5 * u.pixel,
@@ -547,32 +510,12 @@ class OB:
                                                               (val.pixel + 4) * u.pixel)}))
         g_initfull = np.sum(g_inits)
         g_fits = fit_lines(spectrum, g_initfull, window=8 * u.pixel)
-        initdf['newpixel'] = [val.mean.value for val in g_fits]
-        if usegiven:
-            return initdf
-        comp: float = np.mean(spectrum.flux) + np.std(spectrum.flux)
-        lines: QTable = find_lines_derivative(spectrum, comp)
-        if len(lines) > len(lablines):
-            comp += np.std(spectrum.flux)
-        elif len(lines) < 10:
-            comp -= np.std(spectrum.flux) * 0.5
-        lines: QTable = find_lines_derivative(spectrum, comp)
-        lines['line_center'] /= u.pixel
-        lines['strength']: QTable.Column = spline(lines['line_center'])
-        keep: list = []
-        linesdf: pd.DataFrame = lines.to_pandas()
-        for j, row in linesdf.iterrows():
-            cutdf: pd.DataFrame = linesdf[np.logical_and(linesdf.line_center > row.line_center - 4,
-                                                         linesdf.line_center < row.line_center + 4)].copy()
-            idx: int = cutdf.strength.idxmax()
-            keep.append(idx)
-        keep = list(set(keep))
-        linesdf: pd.DataFrame = linesdf.iloc[keep].copy()
-        linesdf.reset_index(drop=True, inplace=True)
-        linesdf: pd.DataFrame = self.findlines(lablines.copy(), linesdf.copy(), spectrum, initfit)
-        pix_wave = pd.DataFrame({'pixel': linesdf.line_center, 'wave': linesdf.wave})
-        pix_wave.sort_values('pixel', inplace=True, ignore_index=True)
-        return pix_wave
+        if len(g_inits) > 1:
+            initsolution['newpixel'] = [val.mean.value for val in g_fits]
+        else:
+            initsolution['newpixel'] = g_fits.mean.value
+        initsolution.pixel = initsolution.newpixel
+        return initsolution[['pixel', 'wave']]
 
     def solution_fitter(self, df: pd.DataFrame, ax: Sequence[plt.Axes]) -> Poly:
         """
@@ -591,51 +534,36 @@ class OB:
             The combined polynomial solution
         """
         def dofits():
-            linfit: Cheb = Cheb.fit(df.pixel.values, df.wave.values, deg=1, full=True)[0]
-            _residual: np.ndarray = linfit(df.pixel.values) - df.wave.values
+            _pcomb: Cheb = Cheb.fit(df.pixel.values, df.wave.values, deg=1, full=True)[0]
+            _residual: np.ndarray = _pcomb(df.pixel.values) - df.wave.values
             axtop.plot(df.pixel, _residual, color=cols[i], lw=0, marker='x')
-            thirdorder: Cheb = Cheb.fit(df.pixel.values, _residual, deg=4, full=True)[0]
-            axtop.plot(*thirdorder.linspace(), color=cols[i], ls='--', label=f'Linear Residual {i}')
-            _pcomb: Cheb = linfit - thirdorder
-            _residual: np.ndarray = thirdorder(df.pixel.values) - _residual
-            # axbot.plot(df.pixel, _residual, color=cols[i], marker='x', lw=0)
-            return _pcomb, _residual
+            chebfit: Cheb = Cheb.fit(df.pixel.values, _residual, deg=len(df) // 2, full=True)[0]
+            axtop.plot(*chebfit.linspace(), color=cols[i], ls='--', label=f'Residual N={len(df)}')
+            _pcomb: Cheb = _pcomb - chebfit
+            _residual: np.ndarray = _pcomb(df.pixel.values) - df.wave.values
+            axbot.plot(df.pixel, _residual, color=cols[i], marker='x', lw=0)
+            df['residual'] = _residual
+            _df = df[np.abs(df.residual) < 1].copy()
+            # chebresfit: Cheb = Cheb.fit(_df.pixel.values, _df.residual.values, deg=4, full=True)[0]
+            # axbot.plot(*chebresfit.linspace(), ls='--', color=cols[i])
+            # _pcomb -= chebresfit
+            _residual = _pcomb(_df.pixel.values) - _df.wave.values
+            return _pcomb, _residual, _df
         axtop, axbot = ax
         axtop: plt.Axes = axtop
         axbot: plt.Axes = axbot
         cols: list = ['tab:' + i for i in ('cyan', 'blue', 'purple', 'pink', 'orange', 'red')]
         i: int = 0
-        initsolution: np.ndarray = np.loadtxt(config.initsolution, unpack=True, usecols=(0, 1))
-        initfit: Poly = Poly.fit(initsolution[1], initsolution[0], deg=1, full=True)[0]
-        residual = initfit(initsolution[1]) - initsolution[0]
-        axtop.plot(initsolution[1], residual, 'kx')
-        initfit: Poly = Poly.fit(initsolution[1], residual, deg=3, full=True)[0]
-        axtop.plot(*initfit.linspace(), 'k--', label=f'Initial Solution')
-        pcomb, residual = dofits()
-        i += 1
-        df['residual'] = residual
-        df['residiff'] = np.abs(df.residual.diff())
-        df['pixdiff'] = df.pixel.diff()
-        df = df[np.logical_not(np.logical_or(df.residiff > 50,
-                                             np.logical_and(df.pixdiff < 50,
-                                                            df.residiff > 10)))].copy()
-        residual = dofits()[1]
-        i += 1
-        df['residual'] = residual
-        df['residiff'] = np.abs(df.residual.diff())
-        df.fillna(0, inplace=True)
-        df = df[df.residiff < 3 * np.std(df.residual)].copy()
-        pcomb, residual = dofits()
-        df['residual'] = residual
-        thirdorder2: Cheb = Cheb.fit(df.pixel.values, df.residual.values, deg=4, full=True)[0]
-        # axbot.plot(*thirdorder2.linspace(), ls='--', color=cols[i])
-        i += 1
-        pcomb -= thirdorder2
-        residual = thirdorder2(df.pixel.values) - df.residual.values
-        axbot.plot(df.pixel, residual, color=cols[i], marker='x', lw=0)
+        pcomb: Cheb = Cheb.fit(df.pixel.values, df.wave.values, deg=1, full=True)[0]
+        residual: np.ndarray = pcomb(df.pixel.values) - df.wave.values
+        while i < 2:
+            pcomb, residual, df = dofits()
+            residual = np.abs(residual)
+            df = df[residual < 3 * np.std(residual)].copy()
+            i += 1
         iqr: np.ndarray = np.subtract(*np.quantile(residual, [.75, .25]))
-        rms: float = np.sqrt(np.sum(np.square(residual) / len(residual)))
-        rmsd: float = np.sqrt(np.sum(np.square(residual)) / len(residual))
+        rms: float = np.sqrt(np.sum(np.square(residual)) / len(residual))
+        rmsd: float = np.sqrt(np.sum(np.square(0 - residual)) / len(residual))
         rmsdiqr: float = rmsd / iqr
         self.logger(f'RMS = {rms} for {len(residual)} points')
         self.logger(f'Arc solution RMSDIQR {rmsdiqr}')
@@ -663,18 +591,17 @@ class OB:
         arcfiles = glob.glob(ptoarcs)
         all_pix_wave = pd.DataFrame(columns=('pixel', 'wave'))
         for i, arc in enumerate(arcfiles):
-            arcdata = self.fopener(arc)  # extract whole arc
-            arcdata = np.subtract(arcdata, self.master_bias)  # bias subtract
-            arcdata = np.divide(arcdata, self.master_flat, where=np.logical_not(np.isclose(self.master_flat, 0)))
+            arcdata = self.fopenbisub(arc, self.master_bias)  # extract whole arc
+            arcdata = self.flat_field(arcdata, self.master_flat)
             arccut: np.ndarray = arcdata[:, cpix - 1]  # just central pixel stripe
             lamp = getheader(arc, ext=0)['OBJECT'].split('_')[-1].lower()
             pix_wave = self.identify(pixel, arccut, lamp)
             all_pix_wave = all_pix_wave.append(pix_wave).reset_index(drop=True)
         all_pix_wave.sort_values('pixel', inplace=True, ignore_index=True)
-        arcdata = getdata('stuart/ftb_arcs_use_wav_cal.fits')
-        arccut = arcdata[:, cpix - 1].flatten()
-        all_pix_wave = self.identify(pixel, arccut, 'all', usegiven=True)
-        all_pix_wave.sort_values('pixel', inplace=True, ignore_index=True)
+        # arcdata = getdata('stuart/ftb_arcs_use_wav_cal.fits')
+        # arccut = arcdata[:, cpix - 1].flatten()
+        # all_pix_wave = self.identify(pixel, arccut, 'all', usegiven=True)
+        # all_pix_wave.sort_values('pixel', inplace=True, ignore_index=True)
         soln = self.solution_fitter(all_pix_wave, ax2)
         for ax in axmain:
             ax.plot(all_pix_wave.pixel, all_pix_wave.wave, 'kx')
@@ -737,7 +664,7 @@ class OB:
         data : np.ndarray
             The full CCD that will needs to be flat fielded
         """
-        return np.divide(data, flat, where=flat != 0)  # returns 0 on the bad pixel masks
+        return np.divide(data, flat, where=np.logical_not(np.isclose(flat, 0)))  # returns 0 on the bad pixels
 
     @staticmethod
     def back_subtract(data: float, back: float) -> float:
@@ -758,7 +685,7 @@ class OB:
         return backsubbed
 
     @staticmethod
-    def find_back(segment: np.ndarray) -> float:
+    def find_back(segment: np.ndarray, cpix: float, xsmall: np.ndarray) -> Tuple[np.ndarray, Cheb]:
         """
         Finds the background value using an iterative mode
 
@@ -766,28 +693,33 @@ class OB:
         ----------
         segment: np.ndarray
             Aperture axis cut off
+        cpix: float
+            The previous row aperture centre
+        xsmall: np.ndarray
+            The array of pixel indices
 
         Returns
         -------
-        backmode: float
-            The modal background count representing the sky
+        background: np.ndarray
+            The vector background count representing the sky
+        chebfit: Chebyshev
+            The chebyshev fit for the background
         """
-        backmode = np.nanmedian(segment)  # start with median value as background
-        i = len(segment)  # start bin size as segment length
-        significant = False
-        while not significant:
-            hist, edges = np.histogram(segment, bins=i)  # bin the values
-            significant = np.max(hist) > np.mean(hist) + np.std(hist) * 2  # if the mode is 2 sigma above the mean
-            if i == 5:  # if the number of bins = number of pixels
-                significant = True
-            if significant:  # if either of last two true
-                modeind = np.argmax(hist)  # which index has the modal value
-                backmode = np.mean(edges[modeind: modeind + 2])  # the mean value of that bin is the background
-            else:
-                i -= 5  # decrease bin size by 5 if the mode is not yet significant
-        return backmode
+        leftmin = np.floor(cpix - 49).astype(int) if cpix - 49 > 0 else 0  # left region start
+        leftmax = np.floor(cpix - 31).astype(int) if cpix - 30 > 0 else leftmin + 19  # left region end
+        rightmax = np.ceil(cpix + 39).astype(int) if cpix + 40 < len(segment) else len(segment)  # right region end
+        rightmin = np.ceil(cpix + 19).astype(int) if cpix + 19 < len(segment) else rightmax - 21  # right region start
+        reg1: np.ndarray = np.median(segment[leftmin: leftmax])  # median count of left region
+        reg2: np.ndarray = np.median(segment[rightmin: rightmax])  # median count of right region
+        ind1: np.ndarray = np.median(xsmall[leftmin: leftmax])  # median index of left region
+        ind2: np.ndarray = np.median(xsmall[rightmin: rightmax])  # median index of right region
+        backmed: np.ndarray = np.array([reg1, reg2])  # the two background medians
+        indmed: np.ndarray = np.array([ind1, ind2])  # the two index medians
+        chebfit: Cheb = Cheb.fit(indmed, backmed, deg=1, full=True)[0]  # linear fit between regions
+        background: np.ndarray = chebfit(xsmall)  # the background on a pixel by pixel basis
+        return background, chebfit
 
-    def peak_average(self, segment: np.ndarray, cpix: int, ind: int, jdict: dict) \
+    def peak_average(self, segment: np.ndarray, cpix: float, ind: int, jdict: dict) \
             -> Tuple[float, int, int, int, dict]:
         """Takes the strip of the CCD and gets the median around the peak
 
@@ -797,69 +729,109 @@ class OB:
         ----------
         segment : np.ndarray
             The row around the spectral pixel center
-        cpix : int
+        cpix : float
             The central pixel value
         ind : int
             Index along dispersion axis
         jdict : dict
             Dictionary of extraction results
         """
-        # TODO: improve extraction method
         jdict[ind] = thisdict = {}
-        cpix = round(cpix)
-        backmode = self.find_back(segment)
-        if self.haveaperture:
-            leftwidth, rightwidth = self.aptleft[ind], self.aptright[ind]
-        else:
-            leftwidth, rightwidth = 10, 10
-        minind = cpix - leftwidth if cpix - leftwidth >= 0 else 0
-        maxind = cpix + rightwidth if cpix + rightwidth <= len(segment) else len(segment)
-        backsub = np.array([self.back_subtract(i, backmode) for i in segment])  # subtract the background from row
-        minreg = np.min(np.abs(backsub))
-        region = np.abs(np.subtract(backsub, minreg)).astype(float)
-        xsmall = np.arange(len(region), dtype=float)
-        xbig = np.linspace(0, len(region), 1000, endpoint=False, dtype=float)
-        amp = np.nanmax(region[minind: maxind]).astype(float)
+        xsmall = np.arange(len(segment), dtype=float)
+        background, backfit = self.find_back(segment, cpix, xsmall)
+        leftwidth, rightwidth = 2.5, 2.5
+        minind = np.floor(cpix - leftwidth).astype(int) if cpix - leftwidth >= 0 else 0
+        maxind = np.ceil(cpix + rightwidth).astype(int) if cpix + rightwidth <= len(segment) else len(segment)
+        backsub = np.subtract(segment, background, out=np.zeros_like(segment),
+                              where=np.greater(segment, background))
+        minreg = np.min(backsub)
+        xbig = np.linspace(0, len(backsub), 1000, endpoint=False, dtype=float)
+        amp = np.nanmax(backsub[minind: maxind]).astype(float)
         thisdict['xsmall'] = xsmall.tolist()
         thisdict['xbig'] = xbig.tolist()
-        yvals = np.interp(xbig, xsmall, region)
+        yvals = yvals_gauss = np.interp(xbig, xsmall, backsub)
+        bigback = backfit(xbig)
         thisdict['region'] = segment.astype(float).tolist()
-        thisdict['ybig'] = (yvals + backmode + minreg).astype(float).tolist()
-        p0 = [amp, cpix, 2]
-        try:
-            gfit = curve_fit(self.gaussian, xbig, yvals, p0=p0,
-                             bounds=([0, minind, 0.5], [1.2 * amp, maxind, 3]))[0]
-        except ValueError:
-            gfit = p0
-        except RuntimeError:
-            gfit = p0
-        yvals = self.gaussian(xbig, *gfit)
-        xstd = gfit[2]
-        hwhm = np.sqrt(2 * np.log(2)) * xstd
-        bigcpix = cpix = gfit[1]
-        bigcpix_mhwhm = bigcpix - 0.75 * hwhm
-        bigcpix_phwhm = bigcpix + 0.75 * hwhm
-        try:
-            cpix_mhwhm = np.flatnonzero(xsmall > bigcpix_mhwhm)[0]
-        except IndexError:
-            cpix_mhwhm = 0
-        try:
-            cpix_phwhm = np.flatnonzero(xsmall > bigcpix_phwhm)[0]
-        except IndexError:
-            cpix_phwhm = len(xsmall)
-        try:
-            bpix_lowind = np.flatnonzero(xbig > bigcpix_mhwhm)[0]
-        except IndexError:
-            bpix_lowind = 0
-        try:
-            bpix_highind = np.flatnonzero(xbig > bigcpix_phwhm)[0]
-        except IndexError:
-            bpix_highind = len(xbig)
-        thisdict['yfit'] = (yvals + backmode + minreg).astype(float).tolist()
-        thisdict['params'] = [float(bigcpix_mhwhm), float(bigcpix), float(bigcpix_phwhm),
-                              float(amp), float(minreg), float(backmode)]
-        signal = np.trapz(yvals[bpix_lowind: bpix_highind] + minreg)
-        return signal, cpix_mhwhm, cpix, cpix_phwhm, backmode, jdict
+        thisdict['ybig'] = (yvals + bigback).astype(float).tolist()
+        if self.extractmethod == 'optimal':
+            p0 = [amp, cpix, 2]
+            try:
+                gfit = curve_fit(self.gaussian, xbig, yvals, p0=p0,
+                                 bounds=([0, minind, .5], [1.2 * amp, maxind, 6]))[0]
+            except (ValueError, RuntimeError):
+                gfit = p0
+            yvals_gauss = self.gaussian(xbig, *gfit)
+            ysmall = self.gaussian(xsmall, *gfit)
+            amp = gfit[0]
+            bigslice: np.ndarray = np.flatnonzero(yvals_gauss > 0.2 * amp)
+            smallslice: np.ndarray = np.flatnonzero(ysmall > 0.2 * amp)
+            signal: float = np.trapz(backsub[smallslice])
+            bigcpix_minind, bigcpix_maxind = xbig[bigslice][[0, -1]]
+            cpix_minind, cpix_maxind = xsmall[smallslice][[0, -1]]
+        elif self.extractmethod == 'simple':
+            cpix_minind = np.floor(cpix - 5).astype(int) if cpix - 5 > 0 else 0
+            cpix_maxind = np.ceil(cpix + 6).astype(int) if cpix + 6 < len(backsub) else len(backsub)
+            bigcpix_minind = xbig[np.flatnonzero(xbig > cpix_minind)[0]]
+            bigcpix_maxind = xbig[np.flatnonzero(xbig > cpix_maxind)[0]]
+            signal: float = np.trapz(backsub[cpix_minind: cpix_maxind])
+        else:
+            raise ValueError('Invalid extraction method given, must be of "simple", "optimal"')
+        backcpix = backfit(cpix)
+        thisdict['yfit'] = (yvals_gauss + bigback).astype(float).tolist()
+        thisdict['background'] = bigback.astype(float).tolist()
+        thisdict['params'] = [float(bigcpix_minind), float(cpix), float(bigcpix_maxind),
+                              float(amp) + float(backcpix),
+                              float(minreg)]
+
+        return signal, cpix_minind, cpix_maxind, backcpix, jdict
+
+    def trace(self, data: np.ndarray):
+        def centerspatial(i: int, cpix: float) -> Tuple[float, float]:
+            linedata: np.ndarray = np.median(data[i - 5: i + 6], axis=0)
+            yvals: np.ndarray = np.interp(spatialbig, spatial, linedata)
+            amp: float = np.max(yvals)
+            if cpix is None:
+                cpix = np.argmax(linedata)
+            minind: int = cpix - 11 if cpix - 11 > 0 else 0
+            maxind: int = cpix + 11 if cpix + 11 < len(spatial) else len(spatial)
+            p0 = [amp, cpix, 2]
+            try:
+                gfit = curve_fit(self.gaussian, spatialbig, yvals, p0=p0,
+                                 bounds=([0, minind, .5], [1.2 * amp, maxind, 6]))[0]
+            except (ValueError, RuntimeError):
+                gfit = p0
+            medcent: float = gfit[1]
+            medcenterr: float = gfit[2]
+            return medcent, medcenterr
+        firstline: int = self.tracelinestart
+        spatial: np.ndarray = np.arange(len(data[0]))
+        spatialbig: np.ndarray = np.linspace(spatial.min(), spatial.max(), len(spatial) * 10)
+        firstpix, firstpixerr = centerspatial(firstline, None)
+        dcent = {firstline: [firstpix, firstpixerr]}
+        stepdownlines: np.ndarray = np.arange(firstline, 0, -5)[1:-1]
+        stepuplines: np.ndarray = np.arange(firstline, len(data), 5)[1:-1]
+        for steparr in (stepdownlines, stepuplines):
+            for line in steparr:
+                linecent, linecenterr = centerspatial(line, firstpix)
+                if linecent is None:
+                    continue
+                dcent[line] = [linecent, linecenterr]
+        dfcent = pd.DataFrame(dcent).T
+        dfcent.rename(columns={0: 'pixel', 1: 'pixelerr'}, inplace=True)
+        dfcent.sort_index(inplace=True)
+        spcent: Poly = Poly.fit(dfcent.index.values, dfcent.pixel.values, deg=3, full=True)[0]
+        dfcent['residual'] = np.abs(spcent(dfcent.index.values) - dfcent.pixel.values)
+        dfcentcut = dfcent[dfcent.residual < 3 * dfcent.pixelerr].copy()
+        if len(dfcentcut) > len(dfcent) // 2:
+            spcent: Poly = Poly.fit(dfcentcut.index.values, dfcentcut.pixel.values, deg=3, full=True)[0]
+            dfcent = dfcentcut
+        residual: np.ndarray = np.abs(spcent(dfcent.index.values) - dfcent.pixel.values)
+        iqr: np.ndarray = np.subtract(*np.quantile(residual, [.75, .25]))
+        rms: float = np.sqrt(np.sum(np.square(residual)) / len(residual))
+        rmsd: float = np.sqrt(np.sum(np.square(0 - residual)) / len(residual))
+        rmsdiqr: float = rmsd / iqr
+        self.logger(f'Trace RMS: {rms:.3f}, RMSIQR: {rmsdiqr:.3f} for N={len(residual)}')
+        return spcent
 
     def extract(self, data: np.ndarray, jdict: dict) -> Tuple[np.ndarray, np.ndarray,
                                                               np.ndarray, np.ndarray,
@@ -879,20 +851,21 @@ class OB:
         """
         data: np.ndarray = data[:, self.minspat: self.maxspat]  # slicing spectra
         pixels: np.ndarray = np.arange(self.pixlow, self.pixhigh + 1)
-        peaks, aptleft, aptcent, aptright, background = np.empty_like(pixels), np.empty_like(pixels), \
-            np.empty_like(pixels), np.empty_like(pixels), np.empty_like(pixels)
+        spcent: Poly = self.trace(data)
+        peaks: np.ndarray = np.empty_like(pixels, dtype=float)
+        aptleft: np.ndarray = np.empty_like(pixels, dtype=float)
+        aptcent: np.ndarray = spcent(pixels)
+        aptright: np.ndarray = np.empty_like(pixels, dtype=float)
+        background: np.ndarray = np.empty_like(pixels, dtype=float)
         for i, row in tqdm(enumerate(data), total=len(data), desc='Extracting', leave=None):
-            if not i:
-                cpix = len(row) // 2
-            else:
-                cpix = aptcent[i - 1]
+            cpix = aptcent[i]
             peak_extract = self.peak_average(row, cpix, i, jdict)
             peaks[i] = peak_extract[0]
             aptleft[i] = peak_extract[1]
-            aptcent[i] = peak_extract[2]
-            aptright[i] = peak_extract[3]
-            background[i] = peak_extract[4]
-            jdict = peak_extract[5]
+            aptright[i] = peak_extract[2]
+            background[i] = peak_extract[3]
+            jdict = peak_extract[4]
+        peaks *= self.gain
         return pixels, peaks, data, aptleft, aptcent, aptright, background, jdict
 
     @staticmethod
@@ -984,7 +957,7 @@ class OB:
         return wave, flux, error, ftoabs, comb_error, modwave, modflux, moderr
 
     @staticmethod
-    def get_header_info(fname: str) -> Tuple[str, float, float, float]:
+    def get_header_info(fname: str) -> Tuple[str, float, float, float, float]:
         """Gets the standard file name
 
         Parameters
@@ -993,7 +966,8 @@ class OB:
             The UNIX path to the file being opened as a string
         """
         head = getheader(fname, ext=0)  # the observational information on OSIRIS is on the first HDU
-        return head['OBJECT'].rstrip(), head['HUMIDITY'], head['AIRMASS'], head['MJD-OBS'], head['SLITW']
+        return head['OBJECT'].rstrip(), head['HUMIDITY'], head['AIRMASS'], head['MJD-OBS'],\
+            head['SLITW'], head['GAIN']
 
     def json_handler(self, objname: str, perm: str, jobj: dict = None):
         """
@@ -1045,8 +1019,9 @@ class OB:
         plt.colorbar(bpmplot, ax=self.axesstd[6])
         standard_list = self.checkifspectra(glob.glob(self.ptostds))  # list of standards)
         sname = self.get_header_info(standard_list[-1])[0]  # gets name of standard
+        self.gain = self.get_header_info(standard_list[-1])[-1]
         sname = sname.split('_')[-1].lower().replace('-', '')  # converting standard name from header to model name
-        slitwidths = [self.get_header_info(f)[-1] for f in standard_list]
+        slitwidths = [self.get_header_info(f)[-2] for f in standard_list]
         self.logger(f'Standard has slit widths: {slitwidths}')
         self.pbar.update(5)
         # stack raw data
@@ -1079,8 +1054,10 @@ class OB:
         self.pbar.update(5)
         # extract spectra
         # fixed_standard = getdata('stuart/iftb_Ross640_std_ccd2.fits')
-        self.json_handler(sname, 'w', {})
-        jdict = self.json_handler(sname, 'r')
+        jdict = {}
+        if dojsons:
+            self.json_handler(sname, 'w', {})
+            jdict = self.json_handler(sname, 'r')
         pixel, photons, resid, aptleft, aptcent, aptright, back, jdict = self.extract(fixed_standard, jdict)
         if dojsons:
             self.json_handler(sname, 'w', jdict)
@@ -1166,7 +1143,7 @@ class OB:
         object_list = self.checkifspectra(glob.glob(self.ptoobj))  # list of objects
         hum, air, mjd = np.empty(0), np.empty(0), np.empty(0)
         for fname in object_list:
-            _hum, _air, _mjd = self.get_header_info(fname)[1:-1]
+            _hum, _air, _mjd = self.get_header_info(fname)[1:-2]
             _params = _hum, _air, _mjd
             params = [hum, air, mjd]
             for i, param in enumerate(params):
@@ -1187,6 +1164,7 @@ class OB:
         # initialise
         object_list = self.checkifspectra(glob.glob(self.ptoobj))  # list of objects
         tname = self.get_header_info(object_list[-1])[0]
+        self.gain = self.get_header_info(object_list[-1])[-1]
         slitwidths = [self.get_header_info(f)[-1] for f in object_list]
         self.logger(f'Object has slit widths: {slitwidths}')
         # raw data
@@ -1220,15 +1198,17 @@ class OB:
         self.pbar.update(5)
         # extract spectra
         # fixed_object = getdata('stuart/iftb_J1745m1640_com.fits')
-        self.json_handler(tname, 'w', {})
-        jdict = self.json_handler(tname, 'r')
+        jdict = {}
+        if dojsons:
+            self.json_handler(tname, 'w', {})
+            jdict = self.json_handler(tname, 'r')
         pixel, photons, resid,\
         aptleft, aptcent, aptright, back, jdict = self.extract(fixed_object, jdict)
         if dojsons:
             self.json_handler(tname, 'w', jdict)
         del jdict
         reducplot = self.axesobj[7].imshow(resid, cmap='coolwarm', norm=imgnorm, origin='lower', aspect='auto',
-                                           extent=(config.spatialminpix + self.minspat,
+                                           extent=(config.spatialminpix + self.minspat - 1,
                                                    config.spatialminpix + self.maxspat,
                                                    self.pixlow, self.pixhigh))
         plt.colorbar(reducplot, ax=self.axesobj[7])
@@ -1261,7 +1241,10 @@ class OB:
         """
         Writes the standard used and object to files
         """
-        np.savez_compressed(f'{config.redpath}/npdata/{self.ob}_{self.resolution}_{self.prog}_{self.target}',
+        filename = f'{config.redpath}/npdata/{self.ob}_{self.resolution}_{self.prog}_{self.target}'
+        if os.path.exists(filename + '.npz'):
+            os.rename(filename + '.npz', filename + '_bak.npz')
+        np.savez_compressed(filename,
                             target=self.master_target.T, standard=self.master_standard.T,
                             bias=self.master_bias, flat=self.master_flat,
                             cutout=self.target_residual, cutoutstd=self.standard_residual,
@@ -1313,9 +1296,9 @@ class OB:
             ax.set_xlim(np.floor(config.minpix / 100) * 100, np.ceil(config.maxpix / 100) * 100)
         for ax in (self.axesobjarcbot, ):
             ax.set_ylabel(r'$\Delta \lambda\ [\AA]$')
-            # ax.set_ylim(-.015, .015)
+            ax.set_ylim(-.015, .015)
             ax.set_xlim(np.floor(config.minpix / 100) * 100, np.ceil(config.maxpix / 100) * 100)
-            # ax.set_yticks([-.01, 0, .01])
+            ax.set_yticks([-.01, 0, .01])
         for ax in (self.axesstd[12], self.axesobj[12]):
             ax.set_ylabel(r'$\lambda\ [\AA]$')
         self.pbar.update(1)
@@ -1443,6 +1426,8 @@ class Config:
     maxwave: int = 1e5
     maxthread: int = multiprocessing.cpu_count() // 2
     initsolution: str = ''
+    tracelinestart: int = 1292
+    extractmethod: str = 'simple'
 
     def __init__(self, conf_fname: str):
         """
@@ -1529,6 +1514,16 @@ class Config:
                 self.initsolution = str(self.allparams[key])
                 if self.initsolution == '' or not len(glob.glob(self.initsolution)):
                     raise ValueError('No file path given to initial wavelength solution or cannot find file')
+            elif key == 'tracelinestart':
+                try:
+                    self.tracelinestart = int(self.allparams[key])
+                except ValueError:
+                    warnings.warn(f'Using default value for trace line start {self.tracelinestart}')
+            elif key == 'extractmethod':
+                self.extractmethod = str(self.allparams[key])
+                if self.extractmethod == '':
+                    warnings.warn(f'Using default value for extraction method "simple"')
+                    self.extractmethod = 'simple'
             else:
                 warnings.warn(f'Unknown key {key}')
         return
@@ -1710,6 +1705,7 @@ def system_arguments():
 if __name__ == '__main__':  # if called as script, run main module
     # global constants will go here
     print('Compiled.')
+    warnings.filterwarnings('ignore', message='The fit may be')
     # plotting
     conf.do_continuum_function_check = False
     backend('agg')
