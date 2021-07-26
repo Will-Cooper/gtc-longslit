@@ -56,6 +56,7 @@ Config : str
      minpix, maxpix, stripewidth, cpix, minwave, maxwave, maxthread
 """
 from astropy.io.fits import getdata, getheader
+from astropy.convolution import convolve, Box1DKernel
 from astropy.modeling import models
 from astropy.table import Table  # opening files as data tables
 import astropy.units as u
@@ -69,6 +70,7 @@ from numpy.polynomial.chebyshev import Chebyshev as Cheb
 import pandas as pd
 from scipy.optimize import curve_fit
 from scipy.interpolate import UnivariateSpline as Spline3
+from scipy.signal import sawtooth
 from specutils import Spectrum1D, conf
 from specutils.fitting import fit_lines
 from tqdm import tqdm
@@ -110,6 +112,12 @@ class OB:
     figobjarc: plt.Figure = None
     axesobjarctop: plt.Axes = None
     axesobjarcbot: plt.Axes = None
+    figstdtrace: plt.Figure = None
+    axesstdtrace: plt.Axes = None
+    axesstdtracenonlin: plt.Axes = None
+    figobjtrace: plt.Figure = None
+    axesobjtrace: plt.Axes = None
+    axesobjtracenonlin: plt.Axes = None
     pixlow: int = 1
     pixhigh: int = 2051
     indlow: int = 0
@@ -186,6 +194,10 @@ class OB:
         self.figobjarc: plt.Figure = plt.figure(figsize=(8, 5), dpi=300)
         self.axesobjarctop: plt.Axes = self.figobjarc.add_axes([0.1, 0.35, 0.8, 0.55])
         self.axesobjarcbot: plt.Axes = self.figobjarc.add_axes([0.1, 0.1, 0.8, 0.25])
+        self.figstdtrace, (self.axesstdtrace, self.axesstdtracenonlin) = plt.subplots(nrows=2, sharex=True,
+                                                                                      figsize=(8, 5), dpi=300)
+        self.figobjtrace, (self.axesobjtrace, self.axesobjtracenonlin) = plt.subplots(nrows=2, sharex=True,
+                                                                                      figsize=(8, 5), dpi=300)
         # pixel limits
         self.pixlow, self.pixhigh, self.indlow, self.indhigh = self.pixel_constraints()
         self.minspat, self.maxspat = self.spatial_constraints()
@@ -497,7 +509,7 @@ class OB:
         spline = Spline3(pixel, dataline)
         strengths = [np.max([i for i in spline(np.linspace(val - 2, val + 2))]) for val in initsolution.pixel]
         initsolution['strength'] = strengths
-        xhigh = np.linspace(pixel.min(), pixel.max(), len(pixel) * 100)
+        xhigh = np.linspace(np.min(pixel), np.max(pixel), len(pixel) * 100)
         yfit = spline(xhigh)
         spectrum = Spectrum1D(spectral_axis=xhigh * u.pixel, flux=yfit * u.count)
         g_inits = []
@@ -667,25 +679,7 @@ class OB:
         return np.divide(data, flat, where=np.logical_not(np.isclose(flat, 0)))  # returns 0 on the bad pixels
 
     @staticmethod
-    def back_subtract(data: float, back: float) -> float:
-        """Subtracts the background from the extracted spectrum
-
-        Finds the background subtracted signal, if signal is less than the background (a median) set it to 0.
-
-        Parameters
-        ----------
-        data : float
-            The signal that needs to be subtracted
-        back : float
-            The background value to subtract from the signal
-        """
-        backsubbed = data - back
-        if backsubbed < 0:  # if the signal was less than the background
-            backsubbed = 0  # set to 0
-        return backsubbed
-
-    @staticmethod
-    def find_back(segment: np.ndarray, cpix: float, xsmall: np.ndarray) -> Tuple[np.ndarray, Cheb]:
+    def find_back(segment: np.ndarray, cpix: float, xsmall: np.ndarray) -> Tuple[np.ndarray, Cheb, float]:
         """
         Finds the background value using an iterative mode
 
@@ -704,20 +698,25 @@ class OB:
             The vector background count representing the sky
         chebfit: Chebyshev
             The chebyshev fit for the background
+        variance: float
+            The variance on pixel by pixel basis
         """
         leftmin = np.floor(cpix - 49).astype(int) if cpix - 49 > 0 else 0  # left region start
         leftmax = np.floor(cpix - 31).astype(int) if cpix - 30 > 0 else leftmin + 19  # left region end
         rightmax = np.ceil(cpix + 39).astype(int) if cpix + 40 < len(segment) else len(segment)  # right region end
         rightmin = np.ceil(cpix + 19).astype(int) if cpix + 19 < len(segment) else rightmax - 21  # right region start
-        reg1: np.ndarray = np.median(segment[leftmin: leftmax])  # median count of left region
-        reg2: np.ndarray = np.median(segment[rightmin: rightmax])  # median count of right region
+        reg1: np.ndarray = segment[leftmin: leftmax]  # median count of left region
+        reg2: np.ndarray = segment[rightmin: rightmax]  # median count of right region
+        # reg1 = convolve(reg1, Box1DKernel(2))
+        # reg2 = convolve(reg2, Box1DKernel(2))
         ind1: np.ndarray = np.median(xsmall[leftmin: leftmax])  # median index of left region
         ind2: np.ndarray = np.median(xsmall[rightmin: rightmax])  # median index of right region
-        backmed: np.ndarray = np.array([reg1, reg2])  # the two background medians
+        backmed: np.ndarray = np.array([np.median(reg1), np.median(reg2)])  # the two background medians
+        variance: np.ndarray = np.var(np.hstack([reg1, reg2]))
         indmed: np.ndarray = np.array([ind1, ind2])  # the two index medians
         chebfit: Cheb = Cheb.fit(indmed, backmed, deg=1, full=True)[0]  # linear fit between regions
         background: np.ndarray = chebfit(xsmall)  # the background on a pixel by pixel basis
-        return background, chebfit
+        return background, chebfit, variance
 
     def peak_average(self, segment: np.ndarray, cpix: float, ind: int, jdict: dict) \
             -> Tuple[float, int, int, int, dict]:
@@ -738,18 +737,20 @@ class OB:
         """
         jdict[ind] = thisdict = {}
         xsmall = np.arange(len(segment), dtype=float)
-        background, backfit = self.find_back(segment, cpix, xsmall)
+        background, backfit, variance = self.find_back(segment, cpix, xsmall)
         leftwidth, rightwidth = 2.5, 2.5
         minind = np.floor(cpix - leftwidth).astype(int) if cpix - leftwidth >= 0 else 0
         maxind = np.ceil(cpix + rightwidth).astype(int) if cpix + rightwidth <= len(segment) else len(segment)
         backsub = np.subtract(segment, background, out=np.zeros_like(segment),
                               where=np.greater(segment, background))
+        # backsub = np.subtract(segment, background)
+        # backsub = np.divide(backsub, variance)
         minreg = np.min(backsub)
         xbig = np.linspace(0, len(backsub), 1000, endpoint=False, dtype=float)
         amp = np.nanmax(backsub[minind: maxind]).astype(float)
         thisdict['xsmall'] = xsmall.tolist()
         thisdict['xbig'] = xbig.tolist()
-        yvals = yvals_gauss = np.interp(xbig, xsmall, backsub)
+        yvals = np.interp(xbig, xsmall, backsub)
         bigback = backfit(xbig)
         thisdict['region'] = segment.astype(float).tolist()
         thisdict['ybig'] = (yvals + bigback).astype(float).tolist()
@@ -769,67 +770,124 @@ class OB:
             bigcpix_minind, bigcpix_maxind = xbig[bigslice][[0, -1]]
             cpix_minind, cpix_maxind = xsmall[smallslice][[0, -1]]
         elif self.extractmethod == 'simple':
-            cpix_minind = np.floor(cpix - 5).astype(int) if cpix - 5 > 0 else 0
-            cpix_maxind = np.ceil(cpix + 6).astype(int) if cpix + 6 < len(backsub) else len(backsub)
-            bigcpix_minind = xbig[np.flatnonzero(xbig > cpix_minind)[0]]
-            bigcpix_maxind = xbig[np.flatnonzero(xbig > cpix_maxind)[0]]
-            signal: float = np.trapz(backsub[cpix_minind: cpix_maxind])
+            cpix_minind = cpix - 5 if cpix - 5 > 0 else 0
+            cpix_maxind = cpix + 6 if cpix + 6 < len(backsub) else len(backsub)
+            bigcpix_minind: int = np.flatnonzero(xbig > cpix_minind)[0]
+            bigcpix_maxind: int = np.flatnonzero(xbig > cpix_maxind)[0]
+            cpix_minind: int = np.flatnonzero(xsmall > cpix_minind)[0]
+            cpix_maxind: int = np.flatnonzero(xsmall > cpix_maxind)[0]
+            backsubregion: np.ndarray = convolve(backsub[cpix_minind: cpix_maxind], Box1DKernel(2))
+            signal: float = np.sum(backsubregion)
+            yvals_gauss = yvals
         else:
             raise ValueError('Invalid extraction method given, must be of "simple", "optimal"')
         backcpix = backfit(cpix)
         thisdict['yfit'] = (yvals_gauss + bigback).astype(float).tolist()
         thisdict['background'] = bigback.astype(float).tolist()
-        thisdict['params'] = [float(bigcpix_minind), float(cpix), float(bigcpix_maxind),
+        thisdict['params'] = [float(xbig[bigcpix_minind]), float(cpix), float(xbig[bigcpix_maxind]),
                               float(amp) + float(backcpix),
                               float(minreg)]
 
         return signal, cpix_minind, cpix_maxind, backcpix, jdict
 
+    @staticmethod
+    def center1d(initial: float, data: np.ndarray, npts: int = 101,
+                 width: float = 11, radius: float = 11, interpfact: int = 10):
+        def smallinds():
+            _minind = int(interpfact * (xval - halfwidth)) if xval - halfwidth > 0 else 0
+            _maxind = int(interpfact * (xval + halfwidth)) if xval + halfwidth < npts else bignpts
+            return _minind, _maxind
+        x: np.ndarray = np.arange(npts)
+        bignpts: int = int(interpfact * npts)
+        xbig: np.ndarray = np.linspace(x[0], x[-1], bignpts)
+        databig: np.ndarray = np.interp(xbig, x, data)
+        halfwidth: float = width / 2
+        b: float = radius + 1.5 * width
+        bigminind: int = int(interpfact * (initial - b)) if initial - b > 0 else 0
+        bigmaxind: int = int(interpfact * (initial + b)) if initial + b < npts else bignpts
+        xcut: np.ndarray = xbig[bigminind: bigmaxind]
+        integrated = np.empty_like(xcut)
+        for i, xval in enumerate(xcut):
+            minind, maxind = smallinds()
+            integrated[i] = np.trapz(databig[minind: maxind] * sawtooth(xbig[minind: maxind] - xval))
+        mididx: int = (np.argmin(integrated) - np.argmax(integrated)) // 2 + np.argmax(integrated)
+        cpix: float = xcut[mididx]
+        # idxs = argrelmax(databig, order=int(width * interpfact))[0]
+        # idx = idxs[np.argmax(databig[idxs])]
+        # wind = windows.gaussian(npts, halfwidth)
+        # filtered = convolve(databig, wind, mode='same') / np.sum(wind)
+        # idx = np.argmax(filtered)
+        # cpix = xbig[idx]
+        return cpix
+
     def trace(self, data: np.ndarray):
         def centerspatial(i: int, cpix: float) -> Tuple[float, float]:
-            linedata: np.ndarray = np.median(data[i - 5: i + 6], axis=0)
-            yvals: np.ndarray = np.interp(spatialbig, spatial, linedata)
-            amp: float = np.max(yvals)
-            if cpix is None:
-                cpix = np.argmax(linedata)
-            minind: int = cpix - 11 if cpix - 11 > 0 else 0
-            maxind: int = cpix + 11 if cpix + 11 < len(spatial) else len(spatial)
+            minind: int = i - 5 if i - 5 > 0 else 0  # step size down
+            maxind: int = i + 6 if i + 6 < len(data) else len(data)  # step size up
+            linedata: np.ndarray = np.median(data[minind: maxind], axis=0)  # median stacked data in range
+            # yvals: np.ndarray = np.interp(spatialbig, spatial, linedata)
+            amp: float = np.max(linedata)  # guess amplitude
+            if cpix is None:  # first pixel
+                cpix = np.argmax(linedata)  # guess center
+            # medcent: float = self.center1d(cpix, linedata, len(linedata))
+            minind: int = cpix - 11 if cpix - 11 > 0 else 0  # width to look for line down
+            maxind: int = cpix + 11 if cpix + 11 < len(spatial) else len(spatial)  # width to look for line up
             p0 = [amp, cpix, 2]
             try:
-                gfit = curve_fit(self.gaussian, spatialbig, yvals, p0=p0,
+                gfit = curve_fit(self.gaussian, spatial, linedata, p0=p0,
                                  bounds=([0, minind, .5], [1.2 * amp, maxind, 6]))[0]
-            except (ValueError, RuntimeError):
-                gfit = p0
-            medcent: float = gfit[1]
-            medcenterr: float = gfit[2]
-            return medcent, medcenterr
+            except (ValueError, RuntimeError):  # failed fit
+                gfit = p0  # default to input parameters
+            medcent: float = gfit[1]  # fit center
+            return medcent
+
+        if self.haveaperture:
+            (ax1, ax2) = (self.axesobjtrace, self.axesobjtracenonlin)
+        else:
+            (ax1, ax2) = (self.axesstdtrace, self.axesstdtracenonlin)
         firstline: int = self.tracelinestart
         spatial: np.ndarray = np.arange(len(data[0]))
-        spatialbig: np.ndarray = np.linspace(spatial.min(), spatial.max(), len(spatial) * 10)
-        firstpix, firstpixerr = centerspatial(firstline, None)
-        dcent = {firstline: [firstpix, firstpixerr]}
-        stepdownlines: np.ndarray = np.arange(firstline, 0, -5)[1:-1]
-        stepuplines: np.ndarray = np.arange(firstline, len(data), 5)[1:-1]
+        # spatialbig: np.ndarray = np.linspace(spatial.min(), spatial.max(), len(spatial) * 10)
+        firstpix = centerspatial(firstline, None)
+        dcent = {firstline: firstpix}
+        stepdownlines: np.ndarray = np.arange(firstline, 0, -5)[1:]
+        stepuplines: np.ndarray = np.arange(firstline, len(data), 5)[1:]
         for steparr in (stepdownlines, stepuplines):
-            for line in steparr:
-                linecent, linecenterr = centerspatial(line, firstpix)
+            initialpix = firstpix
+            for line in tqdm(steparr, total=len(steparr), leave=None, desc='Tracing'):
+                linecent = centerspatial(line, initialpix)
                 if linecent is None:
                     continue
-                dcent[line] = [linecent, linecenterr]
-        dfcent = pd.DataFrame(dcent).T
-        dfcent.rename(columns={0: 'pixel', 1: 'pixelerr'}, inplace=True)
+                dcent[line] = linecent
+                initialpix = linecent
+        dfcent = pd.DataFrame([dcent, ]).T
+        dfcent.rename(columns={0: 'pixel'}, inplace=True)
         dfcent.sort_index(inplace=True)
         spcent: Poly = Poly.fit(dfcent.index.values, dfcent.pixel.values, deg=3, full=True)[0]
-        dfcent['residual'] = np.abs(spcent(dfcent.index.values) - dfcent.pixel.values)
-        dfcentcut = dfcent[dfcent.residual < 3 * dfcent.pixelerr].copy()
+        ax2.plot(dfcent.index, dfcent.pixel + self.minspat, 'rx')
+        spcentx, spcenty = spcent.linspace()
+        ax2.plot(spcentx, spcenty + self.minspat, 'r--')
+        residual: np.ndarray = spcent(dfcent.index.values) - dfcent.pixel.values
+        iqr: np.ndarray = np.subtract(*np.quantile(residual, [.75, .25]))
+        dfcent['residual'] = residual
+        ax1.plot(dfcent.index, dfcent.residual, 'rx', label=f'Initial, N={len(dfcent)}')
+        [ax1.axhline(iqrval, linestyle='--', color='r') for iqrval in (-iqr, iqr)]
+        dfcentcut = dfcent[np.abs(dfcent.residual) < iqr].copy()
         if len(dfcentcut) > len(dfcent) // 2:
             spcent: Poly = Poly.fit(dfcentcut.index.values, dfcentcut.pixel.values, deg=3, full=True)[0]
             dfcent = dfcentcut
-        residual: np.ndarray = np.abs(spcent(dfcent.index.values) - dfcent.pixel.values)
+        ax2.plot(dfcent.index, dfcent.pixel + self.minspat, 'bx')
+        spcentx, spcenty = spcent.linspace()
+        ax2.plot(spcentx, spcenty + self.minspat, 'b--')
+        residual: np.ndarray = spcent(dfcent.index.values) - dfcent.pixel.values
         iqr: np.ndarray = np.subtract(*np.quantile(residual, [.75, .25]))
         rms: float = np.sqrt(np.sum(np.square(residual)) / len(residual))
         rmsd: float = np.sqrt(np.sum(np.square(0 - residual)) / len(residual))
         rmsdiqr: float = rmsd / iqr
+        dfcent['residual'] = residual
+        ax1.plot(dfcent.index, dfcent.residual, 'bx', label=f'Iterated, N={len(dfcent)}')
+        [ax1.axhline(iqrval, linestyle='--', color='b') for iqrval in (-iqr, iqr)]
+        ax1.legend()
         self.logger(f'Trace RMS: {rms:.3f}, RMSIQR: {rmsdiqr:.3f} for N={len(residual)}')
         return spcent
 
@@ -854,7 +912,7 @@ class OB:
         spcent: Poly = self.trace(data)
         peaks: np.ndarray = np.empty_like(pixels, dtype=float)
         aptleft: np.ndarray = np.empty_like(pixels, dtype=float)
-        aptcent: np.ndarray = spcent(pixels)
+        aptcent: np.ndarray = spcent(pixels - 1)
         aptright: np.ndarray = np.empty_like(pixels, dtype=float)
         background: np.ndarray = np.empty_like(pixels, dtype=float)
         for i, row in tqdm(enumerate(data), total=len(data), desc='Extracting', leave=None):
@@ -866,6 +924,7 @@ class OB:
             background[i] = peak_extract[3]
             jdict = peak_extract[4]
         peaks *= self.gain
+        peaks = convolve(peaks, Box1DKernel(5))
         return pixels, peaks, data, aptleft, aptcent, aptright, background, jdict
 
     @staticmethod
@@ -1242,7 +1301,7 @@ class OB:
         Writes the standard used and object to files
         """
         filename = f'{config.redpath}/npdata/{self.ob}_{self.resolution}_{self.prog}_{self.target}'
-        if os.path.exists(filename + '.npz'):
+        if do_backup and os.path.exists(filename + '.npz'):
             os.rename(filename + '.npz', filename + '_bak.npz')
         np.savez_compressed(filename,
                             target=self.master_target.T, standard=self.master_standard.T,
@@ -1287,6 +1346,14 @@ class OB:
         self.axesstd[10].set_xlabel(r'$\lambda\ [\AA]$')
         self.axesstd[10].set_ylabel('Counts')
         self.axesstd[10].set_yscale('linear')
+        self.axesstdtrace.set_title('Standard Trace')
+        self.axesstdtracenonlin.set_xlabel('Y Pixel [pix]')
+        self.axesstdtrace.set_ylabel(r'$\Delta$ X Pixel [pix]')
+        self.axesstdtracenonlin.set_ylabel('X Pixel [pix]')
+        self.axesobjtrace.set_title('Object Trace')
+        self.axesobjtracenonlin.set_xlabel('Y Pixel [pix]')
+        self.axesobjtrace.set_ylabel(r'$\Delta$ X Pixel [pix]')
+        self.axesobjtracenonlin.set_ylabel('X Pixel [pix]')
         for ax in (self.axesstd[12],
                    self.axesobjarctop, self.axesobjarcbot, self.axesobj[12]):
             ax.set_xlabel('Y Pixel [pix]')
@@ -1322,15 +1389,16 @@ class OB:
             fig.tight_layout(pad=1.5)
         objfname = f'{self.ob}_{self.resolution}_{self.prog}_{self.target}.png'
         stdfname = f'{self.ob}_{self.resolution}_{self.prog}_{self.standard_name}_for_{self.target}.png'
-        for fname in (objfname, stdfname):
-            fnameback = fname[:fname.find('.png')] + '.bak.png'
-            try:
-                os.rename(f'{config.redpath}/reduction/{fname}', f'{config.redpath}/reduction/{fnameback}')
-            except (FileNotFoundError, OSError):
-                pass  # if it's not there already, whatever
+        if do_backup:
+            for fname in (objfname, stdfname):
+                fnameback = fname[:fname.find('.png')] + '.bak.png'
+                if os.path.exists(f'{config.redpath}/reduction/{fname}'):
+                    os.rename(f'{config.redpath}/reduction/{fname}', f'{config.redpath}/reduction/{fnameback}')
         self.figobj.savefig(f'{config.redpath}/reduction/{objfname}', bbox_inches='tight')
         self.figstd.savefig(f'{config.redpath}/reduction/{stdfname}', bbox_inches='tight')
         self.figobjarc.savefig(f'{config.redpath}/arcs/{objfname}', bbox_inches='tight')
+        self.figstdtrace.savefig(f'{config.redpath}/trace/{stdfname}', bbox_inches='tight')
+        self.figobjtrace.savefig(f'{config.redpath}/trace/{objfname}', bbox_inches='tight')
         self.pbar.update(1)
         return
 
@@ -1598,7 +1666,7 @@ def env_check():
         warnings.warn(f'Could not find {redpth}, attempting to create')
         os.mkdir(redpth)
     for folder in ('arcs', 'bias', 'calib_funcs', 'flat', 'standards',
-                   'jsons', 'log', 'objects', 'reduction', 'npdata',
+                   'jsons', 'log', 'objects', 'reduction', 'npdata', 'trace',
                    'residuals', 'residuals/objects', 'residuals/standards'):
         if not glob.glob(f'{redpth}/{folder}'):
             warnings.warn(f'Trying to make folder in {redpth}')
@@ -1698,6 +1766,7 @@ def system_arguments():
     myargs.add_argument('-c', '--config-file', help='The config file', required=True)
     myargs.add_argument('-j', '--gen-jsons', action='store_true', default=False, help='Create jsons for live plots?')
     myargs.add_argument('-t', '--trace', action='store_true', default=False, help='Trace profile?')
+    myargs.add_argument('-b', '--backup', action='store_true', default=False, help='Create backup files when saving?')
     _args = myargs.parse_args()
     return _args
 
@@ -1727,6 +1796,7 @@ if __name__ == '__main__':  # if called as script, run main module
     do_all = args.do_all
     do_repeat = args.repeat
     do_trace = args.trace
+    do_backup = args.backup
     if do_all and not do_repeat:
         do_repeat = True
     dojsons = args.gen_jsons
