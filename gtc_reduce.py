@@ -124,6 +124,8 @@ class OB:
     indhigh: int = 2051
     minspat: int = 0
     maxspat: int = 1024
+    spatminind: int = 0
+    spatmaxind: int = 1024
     ptobias: str = ''
     master_bias: np.ndarray = np.empty(0)
     ptoflats: str = ''
@@ -152,6 +154,7 @@ class OB:
     gain: float = 1
     tracelinestart: int = 1287
     extractmethod: str = 'simple'
+    geoshift: pd.DataFrame = pd.DataFrame()
 
     def __init__(self, ptodata: str):
         """
@@ -170,7 +173,7 @@ class OB:
         self.logger(f'Resolution {self.resolution}\nProgramme {self.prog}\nObserving block {self.ob}', w=True)
         try:
             self.reduction(ptodata)
-        except (ValueError, AttributeError, FileNotFoundError, IndexError) as e:
+        except (ValueError, AttributeError, FileNotFoundError, IndexError, KeyError) as e:
             try:
                 self.pbar.close()
             except TypeError:
@@ -199,7 +202,9 @@ class OB:
         self.figobjtrace, (self.axesobjtrace, self.axesobjtracenonlin) = plt.subplots(nrows=2, sharex=True,
                                                                                       figsize=(8, 5), dpi=300)
         # pixel limits
-        self.pixlow, self.pixhigh, self.indlow, self.indhigh = self.pixel_constraints()
+        self.pixlow, self.pixhigh,\
+        self.indlow, self.indhigh,\
+        self.spatminind, self.spatmaxind = self.pixel_constraints()
         self.minspat, self.maxspat = self.spatial_constraints()
         self.tracelinestart = config.tracelinestart - self.pixlow - 1
         self.pbar.update(5)
@@ -227,6 +232,11 @@ class OB:
         # wave solution
         self.ptoarcs = ptodata + '/arc/0*fits'  # path to arcs
         self.logger(f'There are {len(glob.glob(self.ptoarcs))} arcs files')
+        if not os.path.exists(config.geocorrect):
+            self.geoshift = self.geometric_distortion(self.ptoarcs)
+        else:
+            self.geoshift = pd.read_csv(config.geocorrect, names=np.arange(self.spatminind, self.spatmaxind + 1))
+            self.geoshift.set_index(np.arange(self.pixlow, self.pixhigh + 1), inplace=True)
         self.wave_soln = self.arc_solution(self.ptoarcs)
         self.pbar.update(5)
         bpmplot = self.axesobj[6].imshow(self.bpm, cmap=ccd_bincmap, origin='lower', aspect='auto',
@@ -316,13 +326,16 @@ class OB:
         return minspat, maxspat
 
     @staticmethod
-    def pixel_constraints() -> Tuple[int, int, int, int]:
+    def pixel_constraints() -> Tuple[int, int, int, int, int, int]:
         """Finds the constraints for the respective resolution
 
         Use the config minpix and maxpix values to get the limits of extraction in pixel and index space
         """
         xmin, xmax = config.minpix, config.maxpix
-        return xmin, xmax, xmin - 1, xmax  # max index = max pixel to be inclusive (like iraf)
+        indmin = xmin - 1
+        indmax = xmax  # max index = max pixel to be inclusive (like iraf)
+        spatmin, spatmax = config.spatialminpix - 1, config.spatialmaxpix
+        return xmin, xmax, indmin, indmax, spatmin, spatmax
 
     @staticmethod
     def bisub(data: np.ndarray, bias: np.ndarray) -> np.ndarray:
@@ -445,13 +458,10 @@ class OB:
         dtrimmed: np.ndarray
             The trimmed array
         """
-        low = config.spatialminpix - 1
-        high = config.spatialmaxpix
-        if low < 0:
-            low = 0
-        if high > data.shape[1]:
-            high = data.shape[1]
-        dtrimmed = data[self.indlow: self.indhigh, low: high]
+        if np.any(np.less([self.indlow, self.spatminind], 0)) \
+        or np.any(np.greater([self.indhigh, self.spatmaxind], len(data))):
+            raise ValueError('Check indices, not slicing data correctly')
+        dtrimmed = data[self.indlow: self.indhigh, self.spatminind: self.spatmaxind]
         return dtrimmed
 
     @staticmethod
@@ -485,8 +495,75 @@ class OB:
         bpm_flat = self.bpm_applying(median_flat)  # apply bad pixel mask
         return self.normalise(bpm_flat)  # normalised flat
 
+    def geometric_distortion(self, ptoarcs: str) -> pd.DataFrame:
+        cind: int = config.cpix - self.spatminind - 1
+        pixel: np.ndarray = np.arange(self.pixlow, self.pixhigh + 1)
+        arcfiles = glob.glob(ptoarcs)
+        xup: np.ndarray = np.arange(cind, self.spatmaxind - self.spatminind, 20)
+        xdown: np.ndarray = np.arange(cind, self.spatminind, -20)
+        spatial: np.ndarray = np.arange(self.spatminind, self.spatmaxind + 1)
+        shifts = pd.DataFrame(data={xval: np.zeros(pixel.shape) for xval in spatial}, index=pixel)
+        initsol = None
+        for i, arc in tqdm(enumerate(arcfiles), total=len(arcfiles), leave=None, desc='Analysing Arcs'):
+            xy = {}
+            arcdata = self.fopenbisub(arc, self.master_bias)  # extract whole arc
+            arcdata = self.flat_field(arcdata, self.master_flat)
+            lamp = getheader(arc, ext=0)['OBJECT'].split('_')[-1].lower()
+            for xarr in (xup, xdown):
+                for k, x in tqdm(enumerate(xarr), total=len(xarr), leave=None, desc='Identifying'):
+                    if not k:
+                        initsol = None
+                    arccut: np.ndarray = arcdata[:, x]  # just central pixel stripe
+                    pix_wave = self.identify(pixel, arccut, lamp, initsol, True)
+                    initsol = pix_wave
+                    if len(pix_wave):
+                        xy[x] = pix_wave.pixel.values
+            xydf = pd.DataFrame(data=xy)
+            xydf = xydf.reindex(sorted(xydf.columns), axis=1)
+            for tracenum, trace in tqdm(xydf.iterrows(), total=len(xydf), leave=None, desc='Finding shifts'):
+                tracecheb: Cheb = Cheb.fit(trace.index.values, trace.values, deg=6, full=True)[0]  # x to y
+                traceyvals: np.ndarray = tracecheb(spatial)
+                yints = traceyvals.astype(int)
+                diffs: np.ndarray = traceyvals[cind] - traceyvals
+                for k, xval in tqdm(enumerate(spatial), total=len(spatial), leave=None, desc='Assigning shifts'):
+                    shifts[xval][yints[k]] = diffs[k]
+        for k, xval in tqdm(enumerate(spatial), total=len(spatial), leave=None, desc='Assigning shifts'):
+            shiftxcol: pd.Series = shifts[xval].copy()
+            shiftxcol = shiftxcol[np.logical_not(np.isclose(shiftxcol, 0))]
+            try:
+                ycheb: Cheb = Cheb.fit(shiftxcol.index.values, shiftxcol.values, deg=6, full=True)[0]  # y to shift
+            except (np.linalg.LinAlgError, ValueError):
+                shifts[xval] = shifts[xval - 1]
+                continue
+            diffs: np.ndarray = ycheb(pixel)
+            for kk, yval in tqdm(enumerate(pixel), total=len(pixel), leave=None, desc='Assigning shifts'):
+                shifts[xval][yval] = diffs[kk]
+        shifts.to_csv('geoshifttest.csv', header=False, index=False)
+        return shifts
+
+    def transform(self, data: np.ndarray) -> np.ndarray:
+        newdata: np.ndarray = np.zeros_like(data)
+        datalen: int = len(data)
+        for i, spatrow in tqdm(enumerate(data), total=datalen, desc='Transforming', leave=None):
+            for j, val in enumerate(spatrow):
+                shift: float = self.geoshift[j + self.spatminind + 1][i + self.pixlow]
+                sign: int = np.sign(shift).astype(int)
+                shiftind: int = np.floor(shift).astype(int)
+                idiff: int = i + shiftind
+                newi: int = idiff if 0 <= idiff < datalen else None
+                if newi is None:
+                    continue
+                nexti: int = idiff + sign if 0 <= idiff + sign < datalen else None
+                nextiremainder: float = shift - shiftind
+                newiremainder: float = 1 - nextiremainder
+                newdata[newi, j] += val * newiremainder
+                if nexti is not None:
+                    newdata[nexti, j] += val * nextiremainder
+        return newdata
+
     @staticmethod
-    def identify(pixel: np.ndarray, dataline: np.ndarray, lamp: str) -> pd.DataFrame:
+    def identify(pixel: np.ndarray, dataline: np.ndarray, lamp: str,
+                 initsol: pd.DataFrame = None, fastsolve: bool = False) -> pd.DataFrame:
         """
         Identifies the lines in an arc and compares to line list
 
@@ -498,19 +575,31 @@ class OB:
             The 1D array of the arc to have lines identified in
         lamp: str
             The object keyword in the header for which lamp is being checked
+        initsol: pd.DataFrame
+            The initial solution to start looking around, if None use file
+        fastsolve: bool
+            Switch to do a simple solver just to find central pixel
 
         Returns
         -------
         pix_wave: pd.DataFrame
             A dataframe of columns pixel to wavelength
         """
-        initsolution: pd.DataFrame = pd.read_csv(config.initsolution)
-        initsolution: pd.DataFrame = initsolution[[i in lamp for i in initsolution.line]].copy()
+        if initsol is None:
+            initsolution: pd.DataFrame = pd.read_csv(config.initsolution)
+            initsolution: pd.DataFrame = initsolution[[i in lamp for i in initsolution.line]].copy()
+        else:
+            initsolution = initsol
         spline = Spline3(pixel, dataline)
         strengths = [np.max([i for i in spline(np.linspace(val - 2, val + 2))]) for val in initsolution.pixel]
         initsolution['strength'] = strengths
         xhigh = np.linspace(np.min(pixel), np.max(pixel), len(pixel) * 100)
         yfit = spline(xhigh)
+        if fastsolve:
+            ypos = [xhigh[np.argmax([i for i in spline(np.linspace(val - 5, val + 6, 100))]) + int(val - 5) * 100]
+                    for val in initsolution.pixel]
+            initsolution.pixel = ypos
+            return initsolution[['pixel', 'wave']]
         spectrum = Spectrum1D(spectral_axis=xhigh * u.pixel, flux=yfit * u.count)
         g_inits = []
         for i, val in initsolution.iterrows():
@@ -595,7 +684,7 @@ class OB:
         soln: Poly
             The wavelength solution
         """
-        # TODO: make arc solution work for R300R, and improve residuals
+        # TODO: make arc solution work for R300R
         cpix: int = config.cpix - config.spatialminpix
         pixel: np.ndarray = np.arange(self.pixlow, self.pixhigh + 1)
         axmain = self.axesobj[12], self.axesstd[12]
@@ -766,7 +855,7 @@ class OB:
             amp = gfit[0]
             bigslice: np.ndarray = np.flatnonzero(yvals_gauss > 0.2 * amp)
             smallslice: np.ndarray = np.flatnonzero(ysmall > 0.2 * amp)
-            signal: float = np.trapz(backsub[smallslice])
+            signal: float = np.sum(backsub[smallslice])
             bigcpix_minind, bigcpix_maxind = xbig[bigslice][[0, -1]]
             cpix_minind, cpix_maxind = xsmall[smallslice][[0, -1]]
         elif self.extractmethod == 'simple':
@@ -924,7 +1013,6 @@ class OB:
             background[i] = peak_extract[3]
             jdict = peak_extract[4]
         peaks *= self.gain
-        peaks = convolve(peaks, Box1DKernel(5))
         return pixels, peaks, data, aptleft, aptcent, aptright, background, jdict
 
     @staticmethod
@@ -1105,14 +1193,14 @@ class OB:
         self.axesstd[2].imshow(flat_standard, cmap='coolwarm', norm=imgnorm, origin='lower', aspect='auto',
                                extent=(config.spatialminpix, config.spatialmaxpix,
                                        self.pixlow, self.pixhigh))
-        # apply bad pixel mask
-        fixed_standard = flat_standard
+        # apply bad pixel mask & geo correct
+        fixed_standard = self.transform(flat_standard)
         self.axesstd[3].imshow(fixed_standard, cmap='coolwarm', norm=imgnorm, origin='lower', aspect='auto',
                                extent=(config.spatialminpix, config.spatialmaxpix,
                                        self.pixlow, self.pixhigh))
         self.pbar.update(5)
         # extract spectra
-        # fixed_standard = getdata('stuart/iftb_Ross640_std_ccd2.fits')
+        # fixed_standard = getdata('stuart/tr_iftb_Ross640_std_ccd2.fits')
         jdict = {}
         if dojsons:
             self.json_handler(sname, 'w', {})
@@ -1249,14 +1337,14 @@ class OB:
         self.axesobj[2].imshow(flat_object, cmap='coolwarm', norm=imgnorm, origin='lower', aspect='auto',
                                extent=(config.spatialminpix, config.spatialmaxpix,
                                        self.pixlow, self.pixhigh))
-        # apply bad pixel mask
-        fixed_object = flat_object
+        # apply bad pixel mask & geo correct
+        fixed_object = self.transform(flat_object)
         self.axesobj[3].imshow(fixed_object, cmap='coolwarm', norm=imgnorm, origin='lower', aspect='auto',
                                extent=(config.spatialminpix, config.spatialmaxpix,
                                        self.pixlow, self.pixhigh))
         self.pbar.update(5)
         # extract spectra
-        # fixed_object = getdata('stuart/iftb_J1745m1640_com.fits')
+        # fixed_object = getdata('stuart/tr_iftb_J1745m1640_com.fits')
         jdict = {}
         if dojsons:
             self.json_handler(tname, 'w', {})
@@ -1496,6 +1584,7 @@ class Config:
     initsolution: str = ''
     tracelinestart: int = 1292
     extractmethod: str = 'simple'
+    geocorrect: str = ''
 
     def __init__(self, conf_fname: str):
         """
@@ -1592,6 +1681,10 @@ class Config:
                 if self.extractmethod == '':
                     warnings.warn(f'Using default value for extraction method "simple"')
                     self.extractmethod = 'simple'
+            elif key == 'geocorrect':
+                self.geocorrect = str(self.allparams[key])
+                if not os.path.exists(self.geocorrect):
+                    warnings.warn(f'Calculating geometric correction (takes time)')
             else:
                 warnings.warn(f'Unknown key {key}')
         return
