@@ -501,7 +501,7 @@ class OB:
         arcfiles = glob.glob(ptoarcs)
         xup: np.ndarray = np.arange(cind, self.spatmaxind - self.spatminind, 20)
         xdown: np.ndarray = np.arange(cind, self.spatminind, -20)
-        spatial: np.ndarray = np.arange(self.spatminind, self.spatmaxind + 1)
+        spatial: np.ndarray = np.arange(self.spatminind + 1, self.spatmaxind + 1)
         shifts = pd.DataFrame(data={xval: np.zeros(pixel.shape) for xval in spatial}, index=pixel)
         initsol = None
         for i, arc in tqdm(enumerate(arcfiles), total=len(arcfiles), leave=None, desc='Analysing Arcs'):
@@ -524,16 +524,22 @@ class OB:
                 tracecheb: Cheb = Cheb.fit(trace.index.values, trace.values, deg=6, full=True)[0]  # x to y
                 traceyvals: np.ndarray = tracecheb(spatial)
                 yints = traceyvals.astype(int)
+                remainder = traceyvals - yints
                 diffs: np.ndarray = traceyvals[cind] - traceyvals
+                diffs += remainder * np.sign(diffs)
                 for k, xval in tqdm(enumerate(spatial), total=len(spatial), leave=None, desc='Assigning shifts'):
                     shifts[xval][yints[k]] = diffs[k]
         for k, xval in tqdm(enumerate(spatial), total=len(spatial), leave=None, desc='Assigning shifts'):
             shiftxcol: pd.Series = shifts[xval].copy()
+            shiftlen: int = len(shiftxcol)
             shiftxcol = shiftxcol[np.logical_not(np.isclose(shiftxcol, 0))]
+            if not len(shiftxcol):
+                shifts[xval] = np.zeros(shiftlen)
+                continue
             try:
                 ycheb: Cheb = Cheb.fit(shiftxcol.index.values, shiftxcol.values, deg=6, full=True)[0]  # y to shift
             except (np.linalg.LinAlgError, ValueError):
-                shifts[xval] = shifts[xval - 1]
+                exit()
                 continue
             diffs: np.ndarray = ycheb(pixel)
             for kk, yval in tqdm(enumerate(pixel), total=len(pixel), leave=None, desc='Assigning shifts'):
@@ -541,21 +547,29 @@ class OB:
         shifts.to_csv('geoshifttest.csv', header=False, index=False)
         return shifts
 
+    @staticmethod
+    def shiftremainders(shift: float, datalen: int, i: int):
+        sign: int = np.sign(shift).astype(int)
+        shiftind: int = np.floor(shift).astype(int)
+        idiff: int = i + shiftind
+        newi: int = idiff if 0 <= idiff < datalen else None
+        if newi is None:
+            return None
+        nexti: int = idiff + sign if 0 <= idiff + sign < datalen else None
+        nextiremainder: float = shift - shiftind
+        newiremainder: float = 1 - nextiremainder
+        return newi, newiremainder, nexti, nextiremainder
+
     def transform(self, data: np.ndarray) -> np.ndarray:
         newdata: np.ndarray = np.zeros_like(data)
         datalen: int = len(data)
         for i, spatrow in tqdm(enumerate(data), total=datalen, desc='Transforming', leave=None):
             for j, val in enumerate(spatrow):
                 shift: float = self.geoshift[j + self.spatminind + 1][i + self.pixlow]
-                sign: int = np.sign(shift).astype(int)
-                shiftind: int = np.floor(shift).astype(int)
-                idiff: int = i + shiftind
-                newi: int = idiff if 0 <= idiff < datalen else None
-                if newi is None:
+                try:
+                    newi, newiremainder, nexti, nextiremainder = self.shiftremainders(shift, datalen, i)
+                except TypeError:  # if None
                     continue
-                nexti: int = idiff + sign if 0 <= idiff + sign < datalen else None
-                nextiremainder: float = shift - shiftind
-                newiremainder: float = 1 - nextiremainder
                 newdata[newi, j] += val * newiremainder
                 if nexti is not None:
                     newdata[nexti, j] += val * nextiremainder
@@ -591,13 +605,17 @@ class OB:
         else:
             initsolution = initsol
         spline = Spline3(pixel, dataline)
-        strengths = [np.max([i for i in spline(np.linspace(val - 2, val + 2))]) for val in initsolution.pixel]
+        strengths = [np.max([i for i in spline(np.linspace(val - 2, val + 3))]) for val in initsolution.pixel]
         initsolution['strength'] = strengths
         xhigh = np.linspace(np.min(pixel), np.max(pixel), len(pixel) * 100)
         yfit = spline(xhigh)
         if fastsolve:
-            ypos = [xhigh[np.argmax([i for i in spline(np.linspace(val - 5, val + 6, 100))]) + int(val - 5) * 100]
-                    for val in initsolution.pixel]
+            ypos = []
+            for val in initsolution.pixel:
+                xselect = np.linspace(val - 2, val + 3, 100)
+                yselect = spline(xselect)
+                maxy = np.argmax(yselect)
+                ypos.append(xselect[maxy])
             initsolution.pixel = ypos
             return initsolution[['pixel', 'wave']]
         spectrum = Spectrum1D(spectral_axis=xhigh * u.pixel, flux=yfit * u.count)
@@ -676,7 +694,7 @@ class OB:
 
         Parameters
         ----------
-        ptoarcs: str
+        ptoarcs: str.values
             The path to the directory holding the arc files
 
         Returns
@@ -699,10 +717,11 @@ class OB:
             pix_wave = self.identify(pixel, arccut, lamp)
             all_pix_wave = all_pix_wave.append(pix_wave).reset_index(drop=True)
         all_pix_wave.sort_values('pixel', inplace=True, ignore_index=True)
-        # arcdata = getdata('stuart/ftb_arcs_use_wav_cal.fits')
-        # arccut = arcdata[:, cpix - 1].flatten()
-        # all_pix_wave = self.identify(pixel, arccut, 'all', usegiven=True)
-        # all_pix_wave.sort_values('pixel', inplace=True, ignore_index=True)
+        # cpixshifts: pd.Series = self.geoshift[config.cpix]
+        # pixconv: Cheb = Cheb.fit(cpixshifts.index.values, cpixshifts.values, deg=6, full=True)[0]
+        # shifts: np.ndarray = pixconv(all_pix_wave.pixel)
+        # newpix: np.ndarray = [self.shiftremainders(shift, len(shifts), i) for i, shift in enumerate(shifts)]
+        # all_pix_wave.pixel = newpix
         soln = self.solution_fitter(all_pix_wave, ax2)
         for ax in axmain:
             ax.plot(all_pix_wave.pixel, all_pix_wave.wave, 'kx')
