@@ -1,3 +1,6 @@
+# SUPERSEDED BY [PYPEIT](https://github.com/pypeit/PypeIt)
+
+# GTC-Longslit
 A Python-3 script to reduce GTC OSIRIS longslit optical spectra.
 
 It is designed to work over multiple processors and will require a directory for the reduced spectra to be put in,
